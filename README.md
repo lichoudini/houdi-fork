@@ -1,5 +1,27 @@
 # Houdi | Agente IA para ejecución de tareas en español
 
+## Modo Actual (Proxy Terminal Directo)
+
+Este fork está simplificado para operar como proxy directo entre el usuario, el modelo y la terminal:
+
+- El usuario define un objetivo en lenguaje natural.
+- El modelo responde un plan con pasos y comandos exactos.
+- El agente muestra primero la explicación y luego ejecuta la secuencia de comandos.
+- El resultado real de shell vuelve al ciclo hasta completar el objetivo.
+
+Arranque rápido:
+
+```bash
+cp .env.example .env
+# completar OPENAI_API_KEY
+npm run cli
+```
+
+Contexto editable del modelo (proxy terminal):
+
+- Archivo: `docs/proxy-model-context.md`
+- Variable opcional: `PROXY_MODEL_CONTEXT_FILE`
+
 Proyecto open source para arrancar un asistente de operación real por WhatsApp/Telegram/Slack, con arquitectura agéntica y enrutadores semánticos que puedes escalar.
 
 Repositorio oficial:

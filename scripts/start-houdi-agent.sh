@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${PROJECT_DIR}"
+export PATH="${HOME}/bin:${PROJECT_DIR}/bin:${PATH}"
 
 NODE_BIN_CANDIDATE="${NODE_BIN:-}"
 

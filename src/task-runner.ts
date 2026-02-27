@@ -199,22 +199,44 @@ export class TaskRunner {
     }
 
     const cwd = path.resolve(process.cwd(), profile.cwd);
+    const projectBin = path.resolve(process.cwd(), "bin");
+    const nodeBinDir = path.dirname(process.execPath);
+    const currentPath = process.env.PATH ?? "";
+    const pathEntries = currentPath.split(":").filter(Boolean);
+    const nextPathEntries = [...pathEntries];
+    if (!nextPathEntries.includes(projectBin)) {
+      nextPathEntries.unshift(projectBin);
+    }
+    if (!nextPathEntries.includes(nodeBinDir)) {
+      nextPathEntries.unshift(nodeBinDir);
+    }
+    const envPath = nextPathEntries.join(":");
     if (profile.workspaceOnly) {
       validateWorkspaceOnlyExecution(command, args);
     }
-    const child = spawn(command, args, {
-      cwd,
-      shell: false,
-      env: {
-        ...process.env,
-        ...(profile.workspaceOnly
-          ? {
-              HOME: cwd,
-              PWD: cwd,
-            }
-          : {}),
-      },
-    });
+    const env = {
+      ...process.env,
+      PATH: envPath,
+      NODE_BIN: process.execPath,
+      ...(profile.workspaceOnly
+        ? {
+            HOME: cwd,
+            PWD: cwd,
+          }
+        : {}),
+    };
+    const allowShellSyntax = allowsAll && !profile.workspaceOnly;
+    const child = allowShellSyntax
+      ? (spawn(rawInput, {
+          cwd,
+          shell: true,
+          env,
+        }) as ChildProcessWithoutNullStreams)
+      : spawn(command, args, {
+          cwd,
+          shell: false,
+          env,
+        });
 
     const task: Task = {
       id: buildTaskId(),

@@ -1,22 +1,9 @@
 {
   "name": "operator",
-  "description": "Agente operativo restringido (sin privilegios administrativos)",
+  "description": "Agente operativo sin restricciones de comandos",
   "cwd": "./workspace",
-  "workspaceOnly": true,
+  "workspaceOnly": false,
   "allowCommands": [
-    "pwd",
-    "ls",
-    "whoami",
-    "date",
-    "uptime",
-    "uname",
-    "df",
-    "free",
-    "ps",
-    "rg",
-    "cat",
-    "head",
-    "tail",
-    "gmail-api"
+    "*"
   ]
 }

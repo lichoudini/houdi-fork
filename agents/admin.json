@@ -1,7 +1,7 @@
 {
   "name": "admin",
   "description": "Agente de administración con comandos extendidos (usar con cuidado)",
-  "cwd": ".",
+  "cwd": "./workspace",
   "workspaceOnly": false,
   "allowCommands": [
     "pwd",

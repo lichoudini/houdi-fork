@@ -36,6 +36,21 @@ export type GmailMessageAttachment = {
   size: number;
 };
 
+type GmailMessageAttachmentPart = {
+  filename: string;
+  mimeType: string;
+  size: number;
+  attachmentId?: string;
+  inlineData?: string;
+};
+
+export type GmailMessageAttachmentDescriptor = {
+  filename: string;
+  mimeType: string;
+  size: number;
+  attachmentId?: string;
+};
+
 export type GmailMessageDetail = GmailMessageSummary & {
   bodyText: string;
   bodyHtml: string;
@@ -73,6 +88,15 @@ const MAX_ATTACHMENT_COUNT = 8;
 const MAX_ATTACHMENT_SIZE_BYTES = 10 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENTS_BYTES = 20 * 1024 * 1024;
 const OAUTH_ACCESS_TOKEN_REFRESH_INTERVAL_MS = 4 * 60 * 1000;
+const GOOGLE_OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
+const RUNTIME_GMAIL_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/gmail.modify",
+  "https://www.googleapis.com/auth/gmail.send",
+  "https://www.googleapis.com/auth/gmail.compose",
+  "https://www.googleapis.com/auth/gmail.insert",
+  "https://www.googleapis.com/auth/gmail.labels",
+];
 
 function clampInt(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) {
@@ -142,6 +166,13 @@ function isMetadataScopeFullFormatError(error: unknown): boolean {
   return /metadata scope/i.test(message) && /format/i.test(message) && /full/i.test(message);
 }
 
+function normalizeLabelIds(labelIds: string[]): string[] {
+  const normalized = labelIds
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+  return Array.from(new Set(normalized));
+}
+
 function stripHtmlToText(html: string): string {
   return normalizeWhitespace(
     html
@@ -203,6 +234,32 @@ function collectAttachments(part: gmail_v1.Schema$MessagePart | undefined, out: 
 
   for (const child of part.parts ?? []) {
     collectAttachments(child, out);
+  }
+}
+
+function collectAttachmentParts(part: gmail_v1.Schema$MessagePart | undefined, out: GmailMessageAttachmentPart[]): void {
+  if (!part) {
+    return;
+  }
+
+  const filename = (part.filename ?? "").trim();
+  const size = part.body?.size ?? 0;
+  const mimeType = (part.mimeType ?? "application/octet-stream").trim();
+  const attachmentId = part.body?.attachmentId ?? undefined;
+  const inlineData = part.body?.data ?? undefined;
+
+  if (filename && (attachmentId || inlineData)) {
+    out.push({
+      filename,
+      mimeType,
+      size,
+      ...(attachmentId ? { attachmentId } : {}),
+      ...(inlineData ? { inlineData } : {}),
+    });
+  }
+
+  for (const child of part.parts ?? []) {
+    collectAttachmentParts(child, out);
   }
 }
 
@@ -326,6 +383,56 @@ type MimeAttachment = {
   data: Buffer;
 };
 
+type ScopedAccessTokenResponse = {
+  access_token?: string;
+  expires_in?: number;
+  scope?: string;
+  token_type?: string;
+  error?: string;
+  error_description?: string;
+};
+
+async function requestScopedAccessToken(params: {
+  clientId: string;
+  clientSecret: string;
+  refreshToken: string;
+}): Promise<{ accessToken: string; expiresIn: number; scope?: string }> {
+  const body = new URLSearchParams({
+    client_id: params.clientId,
+    client_secret: params.clientSecret,
+    refresh_token: params.refreshToken,
+    grant_type: "refresh_token",
+    scope: RUNTIME_GMAIL_SCOPES.join(" "),
+  });
+
+  const response = await fetch(GOOGLE_OAUTH_TOKEN_ENDPOINT, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  const payload = (await response.json()) as ScopedAccessTokenResponse;
+
+  if (!response.ok) {
+    const description = payload.error_description || payload.error || `HTTP ${response.status}`;
+    throw new Error(`No pude refrescar access token de Gmail con scopes operativos: ${description}`);
+  }
+
+  const accessToken = (payload.access_token ?? "").trim();
+  const expiresIn = Number.parseInt(String(payload.expires_in ?? ""), 10);
+  if (!accessToken) {
+    throw new Error("Google OAuth no devolvió access_token.");
+  }
+  if (!Number.isFinite(expiresIn) || expiresIn <= 0) {
+    throw new Error("Google OAuth no devolvió expires_in válido.");
+  }
+
+  return {
+    accessToken,
+    expiresIn,
+    scope: payload.scope?.trim() || undefined,
+  };
+}
+
 export class GmailAccountService {
   private readonly enabled: boolean;
   private readonly clientId?: string;
@@ -405,11 +512,24 @@ export class GmailAccountService {
       clientId: this.clientId,
       clientSecret: this.clientSecret,
     });
-    oauth2.setCredentials({
-      refresh_token: this.refreshToken,
-    });
+    oauth2.setCredentials({ refresh_token: this.refreshToken });
 
-    await oauth2.getAccessToken();
+    try {
+      const scopedToken = await requestScopedAccessToken({
+        clientId: this.clientId as string,
+        clientSecret: this.clientSecret as string,
+        refreshToken: this.refreshToken as string,
+      });
+      oauth2.setCredentials({
+        refresh_token: this.refreshToken,
+        access_token: scopedToken.accessToken,
+        expiry_date: Date.now() + Math.max(30, scopedToken.expiresIn - 30) * 1000,
+        ...(scopedToken.scope ? { scope: scopedToken.scope } : {}),
+      });
+    } catch {
+      // Fallback al flujo estándar para no romper compatibilidad si Google rechaza el parámetro scope.
+      await oauth2.getAccessToken();
+    }
 
     const client = google.gmail({
       version: "v1",
@@ -620,6 +740,28 @@ export class GmailAccountService {
     if (normalizedQuery) {
       request.q = normalizedQuery;
     }
+    return await this.listMessagesFromRequest(gmail, request);
+  }
+
+  async listMessagesByLabelIds(labelIds: string[], limitInput?: number): Promise<GmailMessageSummary[]> {
+    const gmail = await this.getGmailClient();
+    const normalizedLabels = normalizeLabelIds(labelIds);
+    if (normalizedLabels.length === 0) {
+      return [];
+    }
+    const request: gmail_v1.Params$Resource$Users$Messages$List = {
+      userId: "me",
+      maxResults: this.resolveLimit(limitInput),
+      includeSpamTrash: false,
+      labelIds: normalizedLabels,
+    };
+    return await this.listMessagesFromRequest(gmail, request);
+  }
+
+  private async listMessagesFromRequest(
+    gmail: gmail_v1.Gmail,
+    request: gmail_v1.Params$Resource$Users$Messages$List,
+  ): Promise<GmailMessageSummary[]> {
     const list = await gmail.users.messages.list(request);
     const refs = list.data.messages ?? [];
     if (refs.length === 0) {
@@ -743,6 +885,63 @@ export class GmailAccountService {
       draftId: response.data.id ?? "",
       messageId: response.data.message?.id ?? "",
       threadId: response.data.message?.threadId ?? "",
+    };
+  }
+
+  async updateDraft(params: {
+    draftId: string;
+    to: string;
+    subject: string;
+    body: string;
+    cc?: string;
+    bcc?: string;
+    attachments?: GmailAttachmentInput[];
+  }): Promise<{ draftId: string; messageId: string; threadId: string }> {
+    const draftId = requireNonEmptyMessageId(params.draftId, "draftId");
+    const to = normalizeAddressToSend(params.to);
+    const subject = normalizeSubject(params.subject);
+    const body = normalizeBody(params.body);
+    const cc = normalizeAddressList(params.cc, "cc");
+    const bcc = normalizeAddressList(params.bcc, "bcc");
+    const attachments = await this.resolveAttachments(params.attachments);
+
+    const profile = await this.getProfile();
+    const from = profile.emailAddress || this.accountEmail || "";
+
+    const gmail = await this.getGmailClient();
+    const existing = await gmail.users.drafts.get({
+      userId: "me",
+      id: draftId,
+      format: "metadata",
+    });
+    const threadId = existing.data.message?.threadId ?? undefined;
+
+    const rawMessage = this.buildRawMessage({
+      from,
+      to,
+      subject,
+      body,
+      cc,
+      bcc,
+      attachments,
+    });
+
+    const response = await gmail.users.drafts.update({
+      userId: "me",
+      id: draftId,
+      requestBody: {
+        id: draftId,
+        message: {
+          raw: Buffer.from(rawMessage, "utf8").toString("base64url"),
+          ...(threadId ? { threadId } : {}),
+        },
+      },
+    });
+
+    return {
+      draftId: response.data.id ?? draftId,
+      messageId: response.data.message?.id ?? "",
+      threadId: response.data.message?.threadId ?? threadId ?? "",
     };
   }
 
@@ -1046,5 +1245,133 @@ export class GmailAccountService {
         removeLabelIds: ["STARRED"],
       },
     });
+  }
+
+  async downloadAttachment(params: {
+    messageId: string;
+    filename?: string;
+    attachmentId?: string;
+    index?: number;
+  }): Promise<{
+    filename: string;
+    mimeType: string;
+    size: number;
+    attachmentId: string;
+    data: Buffer;
+  }> {
+    const messageId = requireNonEmptyMessageId(params.messageId, "messageId");
+    const gmail = await this.getGmailClient();
+
+    let payload: gmail_v1.Schema$MessagePart | undefined;
+    try {
+      const response = await gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+        format: "full",
+      });
+      payload = response.data.payload ?? undefined;
+    } catch (error) {
+      if (isMetadataScopeFullFormatError(error)) {
+        throw new Error("No pude leer adjuntos: la cuenta Gmail no tiene scope suficiente para formato full.");
+      }
+      throw error;
+    }
+
+    const parts: GmailMessageAttachmentPart[] = [];
+    collectAttachmentParts(payload, parts);
+    if (parts.length === 0) {
+      throw new Error("El mensaje no tiene adjuntos descargables.");
+    }
+
+    const filenameSelector = params.filename?.trim();
+    const attachmentIdSelector = params.attachmentId?.trim();
+    const normalizedIndex = Number.isFinite(params.index) ? Math.floor(params.index ?? 0) : 0;
+
+    let selected: GmailMessageAttachmentPart | undefined;
+    if (attachmentIdSelector) {
+      selected = parts.find((item) => (item.attachmentId ?? "") === attachmentIdSelector);
+    }
+    if (!selected && filenameSelector) {
+      const lowerName = filenameSelector.toLowerCase();
+      selected = parts.find((item) => item.filename.toLowerCase() === lowerName);
+      if (!selected) {
+        selected = parts.find((item) => item.filename.toLowerCase().includes(lowerName));
+      }
+    }
+    if (!selected && normalizedIndex > 0) {
+      selected = parts[normalizedIndex - 1];
+    }
+    if (!selected) {
+      selected = parts[0];
+    }
+
+    if (selected.inlineData) {
+      return {
+        filename: selected.filename,
+        mimeType: selected.mimeType,
+        size: selected.size,
+        attachmentId: selected.attachmentId ?? "inline-data",
+        data: Buffer.from(
+          selected.inlineData.replace(/-/g, "+").replace(/_/g, "/"),
+          "base64",
+        ),
+      };
+    }
+
+    const attachmentId = selected.attachmentId;
+    if (!attachmentId) {
+      throw new Error("Adjunto sin attachmentId ni inlineData.");
+    }
+
+    const response = await gmail.users.messages.attachments.get({
+      userId: "me",
+      messageId,
+      id: attachmentId,
+    });
+    const rawData = response.data.data ?? "";
+    if (!rawData) {
+      throw new Error("Adjunto sin contenido.");
+    }
+    const data = Buffer.from(rawData.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+    return {
+      filename: selected.filename,
+      mimeType: selected.mimeType,
+      size: data.length || selected.size,
+      attachmentId,
+      data,
+    };
+  }
+
+  async listAttachments(messageIdInput: string): Promise<GmailMessageAttachmentDescriptor[]> {
+    const messageId = requireNonEmptyMessageId(messageIdInput, "messageId");
+    const gmail = await this.getGmailClient();
+
+    let payload: gmail_v1.Schema$MessagePart | undefined;
+    try {
+      const response = await gmail.users.messages.get({
+        userId: "me",
+        id: messageId,
+        format: "full",
+      });
+      payload = response.data.payload ?? undefined;
+    } catch (error) {
+      if (isMetadataScopeFullFormatError(error)) {
+        throw new Error("No pude leer adjuntos: la cuenta Gmail no tiene scope suficiente para formato full.");
+      }
+      throw error;
+    }
+
+    const parts: GmailMessageAttachmentPart[] = [];
+    collectAttachmentParts(payload, parts);
+    if (parts.length === 0) {
+      return [];
+    }
+
+    return parts.map((item) => ({
+      filename: item.filename,
+      mimeType: item.mimeType,
+      size: item.size,
+      ...(item.attachmentId ? { attachmentId: item.attachmentId } : {}),
+    }));
   }
 }
