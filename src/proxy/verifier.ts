@@ -128,7 +128,67 @@ function parseAttachmentDownloadEvidence(history: ExecutedCommand[]): {
   return out;
 }
 
-function applyDeterministicRules(params: {
+function parseOutputField(stdout: string, field: string): string | undefined {
+  const match = stdout.match(new RegExp(`^${field}=([^\\r\\n]+)$`, "m"));
+  return match?.[1]?.trim();
+}
+
+function objectiveLooksLikeEmailSend(normalizedObjective: string): boolean {
+  if (!/\b(correo|mail|email|gmail)\b/.test(normalizedObjective)) {
+    return false;
+  }
+  return /\b(envi\w*|mand\w*|send)\b/.test(normalizedObjective);
+}
+
+function parseEmailSendEvidence(history: ExecutedCommand[]): {
+  hasSendAttempt: boolean;
+  hasSuccessfulSend: boolean;
+  lastMessageId?: string;
+  lastDraftId?: string;
+  hasDraftCreate: boolean;
+} {
+  const out = {
+    hasSendAttempt: false,
+    hasSuccessfulSend: false,
+    lastMessageId: undefined as string | undefined,
+    lastDraftId: undefined as string | undefined,
+    hasDraftCreate: false,
+  };
+
+  for (const item of history) {
+    const command = item.command.trim().toLowerCase();
+    if (command.startsWith("gmail-api draft create ")) {
+      if (item.exitCode === 0) {
+        out.hasDraftCreate = true;
+        const draftId = parseOutputField(item.stdout, "draft_id");
+        if (draftId) {
+          out.lastDraftId = draftId;
+        }
+      }
+      continue;
+    }
+    if (!(command.startsWith("gmail-api send ") || command.startsWith("gmail-api draft send "))) {
+      continue;
+    }
+    out.hasSendAttempt = true;
+    if (item.exitCode !== 0) {
+      continue;
+    }
+    if (!/\bsent=true\b/i.test(item.stdout)) {
+      continue;
+    }
+    const messageId = parseOutputField(item.stdout, "message_id");
+    if (!messageId) {
+      continue;
+    }
+    out.hasSuccessfulSend = true;
+    out.lastMessageId = messageId;
+  }
+
+  return out;
+}
+
+function applyAttachmentDeterministicRules(params: {
   objective: string;
   history: ExecutedCommand[];
   llmVerdict: ObjectiveVerification;
@@ -180,6 +240,65 @@ function applyDeterministicRules(params: {
     summary:
       "Falta ejecutar la descarga del adjunto (`gmail-api attachment download ...`). Listar adjuntos no completa el objetivo.",
   };
+}
+
+function applyEmailSendDeterministicRules(params: {
+  objective: string;
+  history: ExecutedCommand[];
+  llmVerdict: ObjectiveVerification;
+}): ObjectiveVerification {
+  const normalizedObjective = normalizeText(params.objective);
+  if (!objectiveLooksLikeEmailSend(normalizedObjective)) {
+    return params.llmVerdict;
+  }
+
+  const evidence = parseEmailSendEvidence(params.history);
+  if (evidence.hasSuccessfulSend) {
+    return {
+      status: "success",
+      summary: `Email enviado correctamente${evidence.lastMessageId ? `. message_id=${evidence.lastMessageId}` : ""}`,
+    };
+  }
+
+  if (evidence.hasDraftCreate && evidence.lastDraftId) {
+    return {
+      status: "continue",
+      summary: `Solo hay draft creado (${evidence.lastDraftId}). Falta envío real: ejecuta \`gmail-api draft send ${evidence.lastDraftId}\`.`,
+    };
+  }
+
+  if (evidence.hasSendAttempt) {
+    return {
+      status: "continue",
+      summary:
+        "Hubo intento de envío pero sin evidencia `sent=true` y `message_id`. Reintenta `gmail-api send ...` o revisa credenciales/permisos Gmail.",
+    };
+  }
+
+  if (params.llmVerdict.status === "success") {
+    return {
+      status: "continue",
+      summary:
+        "El objetivo es enviar email y aún no hay evidencia de envío real (`sent=true`, `message_id`). Completa con `gmail-api send ...`.",
+    };
+  }
+
+  return {
+    status: "continue",
+    summary: "Falta ejecutar un envío real de email (`gmail-api send ...` o `gmail-api draft send <draftId>`).",
+  };
+}
+
+export function applyDeterministicRules(params: {
+  objective: string;
+  history: ExecutedCommand[];
+  llmVerdict: ObjectiveVerification;
+}): ObjectiveVerification {
+  const withAttachmentRules = applyAttachmentDeterministicRules(params);
+  return applyEmailSendDeterministicRules({
+    ...params,
+    llmVerdict: withAttachmentRules,
+  });
 }
 
 export class ObjectiveVerifier {

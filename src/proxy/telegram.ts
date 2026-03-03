@@ -5,13 +5,19 @@ import { createReadStream } from "node:fs";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import OpenAI from "openai";
 import type { AgentProfile } from "../agents.js";
-import { detectScheduledAutomationIntent } from "../domains/schedule/automation-intent.js";
+import { detectGmailNaturalIntent } from "../domains/gmail/intents.js";
+import { normalizeRecipientName } from "../domains/gmail/recipients-manager.js";
+import { createGmailTextParsers } from "../domains/gmail/text-parsers.js";
+import {
+  detectScheduledAutomationIntent,
+  type ScheduledAutomationDomain,
+} from "../domains/schedule/automation-intent.js";
 import { logError, logInfo } from "../logger.js";
 import { ScheduledTaskSqliteService } from "../scheduled-tasks-sqlite.js";
 import { proxyConfig } from "./config.js";
 import { nextLoopGuardState } from "./loop-guard.js";
 import { createProxyRuntime } from "./runtime.js";
-import type { ExecutedCommand } from "./types.js";
+import type { ExecutedCommand, PlannerResponse } from "./types.js";
 import { presentListingResultForWorkspace, resolveWorkspaceHashtagsInText } from "./workspace-listing.js";
 
 const IMAGE_EXTENSIONS = new Set([
@@ -492,11 +498,22 @@ type ScheduleNaturalIntent = {
   taskTitle?: string;
   dueAt?: Date;
   automationInstruction?: string;
+  automationDomain?: ScheduledAutomationDomain;
   automationRecurrenceDaily?: boolean;
+};
+
+type ScheduledGmailSendPayload = {
+  kind: "gmail-send";
+  to: string;
+  subject: string;
+  body: string;
+  cc?: string;
+  bcc?: string;
 };
 
 type ScheduledNaturalIntentPayload = {
   instruction: string;
+  gmailSend?: ScheduledGmailSendPayload;
   recurrence?: {
     frequency: "daily";
   };
@@ -857,6 +874,195 @@ function extractQuotedSegments(text: string): string[] {
   return values;
 }
 
+function isValidEmailAddress(raw: string): boolean {
+  return /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(raw.trim());
+}
+
+function sanitizeEmailList(raw: string): string {
+  if (!raw.trim()) {
+    return "";
+  }
+  const deduped = new Set<string>();
+  for (const token of raw.split(/[,\s;]+/)) {
+    const email = token.trim().toLowerCase();
+    if (!email || !isValidEmailAddress(email)) {
+      continue;
+    }
+    deduped.add(email);
+  }
+  return [...deduped].join(",");
+}
+
+function inferDefaultSelfEmailRecipient(text: string): string {
+  const normalized = normalizeIntentText(text);
+  const selfCue =
+    /\b(a mi|a mí|a mi mismo|a mí mismo|a mi correo|a mí correo|a mi mail|a mi email|a mi gmail)\b/.test(normalized) ||
+    (/\b(enviame|enviarme|mandame|mandarme)\b/.test(normalized) && /\b(a mi|a mí)\b/.test(normalized));
+  if (!selfCue) {
+    return "";
+  }
+  const configured = (process.env.GMAIL_ACCOUNT_EMAIL ?? "").trim().toLowerCase();
+  return isValidEmailAddress(configured) ? configured : "";
+}
+
+function detectGmailAutoContentKindForSchedule(
+  textNormalized: string,
+): "document" | "poem" | "news" | "reminders" | "stoic" | "assistant-last" | undefined {
+  if (/\b(noticias?|news|nove(?:dad(?:es)?|ades?)|titulares?|actualidad)\b/.test(textNormalized)) {
+    return "news";
+  }
+  if (/\b(poema|poesia|verso|cancion|canción)\b/.test(textNormalized)) {
+    return "poem";
+  }
+  if (/\b(recordatorios?|tareas?\s+pendientes?)\b/.test(textNormalized)) {
+    return "reminders";
+  }
+  if (/\b(estoico|estoicismo|stoic)\b/.test(textNormalized)) {
+    return "stoic";
+  }
+  return undefined;
+}
+
+function buildScheduledGmailSendPayload(params: {
+  rawText: string;
+  instruction: string;
+  taskTitle: string;
+}): { payload?: ScheduledGmailSendPayload; errorText?: string } {
+  const parsers = createGmailTextParsers({
+    normalizeIntentText,
+    extractQuotedSegments,
+    normalizeRecipientName,
+    truncateInline,
+    gmailMaxResults: 20,
+  });
+
+  const deps = {
+    normalizeIntentText,
+    extractQuotedSegments,
+    extractEmailAddresses: parsers.extractEmailAddresses,
+    extractRecipientNameFromText: parsers.extractRecipientNameFromText,
+    inferDefaultSelfEmailRecipient,
+    detectGmailAutoContentKind: detectGmailAutoContentKindForSchedule,
+    parseGmailLabeledFields: parsers.parseGmailLabeledFields,
+    extractLiteralBodyRequest: parsers.extractLiteralBodyRequest,
+    extractNaturalSubjectRequest: parsers.extractNaturalSubjectRequest,
+    detectCreativeEmailCue: parsers.detectCreativeEmailCue,
+    detectGmailDraftRequested: parsers.detectGmailDraftRequested,
+    buildGmailDraftInstruction: parsers.buildGmailDraftInstruction,
+    shouldAvoidLiteralBodyFallback: parsers.shouldAvoidLiteralBodyFallback,
+    parseNaturalLimit: parsers.parseNaturalLimit,
+    buildNaturalGmailQuery: parsers.buildNaturalGmailQuery,
+    gmailAccountEmail: (process.env.GMAIL_ACCOUNT_EMAIL ?? "").trim().toLowerCase(),
+  };
+
+  const primaryIntent = detectGmailNaturalIntent(params.rawText, deps);
+  const fallbackIntent = params.instruction.trim()
+    ? detectGmailNaturalIntent(params.instruction, deps)
+    : ({ shouldHandle: false } as ReturnType<typeof detectGmailNaturalIntent>);
+  const intent =
+    primaryIntent.shouldHandle && primaryIntent.action === "send"
+      ? primaryIntent
+      : fallbackIntent.shouldHandle && fallbackIntent.action === "send"
+        ? fallbackIntent
+        : null;
+  if (!intent) {
+    return {
+      errorText:
+        "No pude estructurar el envío de email. Formato sugerido: 'programa enviar mail a usuario@dominio.com asunto: ... mensaje: ...'.",
+    };
+  }
+
+  const to = (intent.to ?? "").trim().toLowerCase();
+  if (!to || !isValidEmailAddress(to)) {
+    return {
+      errorText:
+        "Para programar un envío de email necesito destinatario válido. Ejemplo: '... a usuario@dominio.com ...'.",
+    };
+  }
+
+  const ccRaw = sanitizeEmailList(intent.cc ?? "");
+  const bccRaw = sanitizeEmailList(intent.bcc ?? "");
+  const cc = ccRaw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item && item !== to)
+    .join(",");
+  const bcc = bccRaw
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => item && item !== to && !cc.split(",").includes(item))
+    .join(",");
+  const subject =
+    sanitizeScheduleTitle((intent.subject ?? "").trim()) ||
+    sanitizeScheduleTitle(params.taskTitle) ||
+    "Recordatorio programado";
+  const bodySeed =
+    (intent.body ?? "").trim() ||
+    params.instruction.trim() ||
+    params.taskTitle.trim() ||
+    params.rawText.trim();
+  const body = truncateInline(bodySeed, 8_000);
+
+  if (!body) {
+    return {
+      errorText:
+        "Para programar un envío de email necesito contenido del mensaje. Ejemplo: 'mensaje: Recordatorio de facturación'.",
+    };
+  }
+
+  return {
+    payload: {
+      kind: "gmail-send",
+      to,
+      subject,
+      body,
+      ...(cc ? { cc } : {}),
+      ...(bcc ? { bcc } : {}),
+    },
+  };
+}
+
+function buildScheduledNaturalIntentPayload(params: {
+  rawText: string;
+  instruction: string;
+  taskTitle: string;
+  automationDomain?: ScheduledAutomationDomain;
+  recurrenceDaily?: boolean;
+}): { payload?: ScheduledNaturalIntentPayload; responseHints: string[]; errorText?: string } {
+  const instruction = params.instruction.trim();
+  if (!instruction) {
+    return {
+      responseHints: [],
+      errorText: "No hay instrucción para la automatización programada.",
+    };
+  }
+  const payload: ScheduledNaturalIntentPayload = {
+    instruction,
+    ...(params.recurrenceDaily ? { recurrence: { frequency: "daily" as const } } : {}),
+  };
+  const responseHints: string[] = [];
+
+  if (params.automationDomain === "gmail") {
+    const gmailPayload = buildScheduledGmailSendPayload({
+      rawText: params.rawText,
+      instruction,
+      taskTitle: params.taskTitle,
+    });
+    if (!gmailPayload.payload) {
+      return {
+        responseHints,
+        errorText: gmailPayload.errorText ?? "No pude preparar el envío programado de email.",
+      };
+    }
+    payload.gmailSend = gmailPayload.payload;
+    responseHints.push(`mail_to: ${gmailPayload.payload.to}`);
+    responseHints.push(`mail_subject: ${gmailPayload.payload.subject}`);
+    responseHints.push("modo: gmail-send-deterministico");
+  }
+
+  return { payload, responseHints };
+}
+
 function extractTaskTitleForCreate(text: string): string {
   const quoted = extractQuotedSegments(text);
   if (quoted.length > 0) {
@@ -948,7 +1154,10 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
   const hasReminderVerb =
     /\b(recordar|recorda|recordame|recordarme|recuerda|recuerdame|agenda|agendame|agendar|programa|programar|fijar|fijame|fija)\b/.test(
       normalized,
-    ) || /\b(haceme|hacerme|hace(?:r)?me)\s+acordar\b/.test(normalized);
+    ) ||
+    /\b(haceme|hacerme|hace(?:r)?me)\s+acordar\b/.test(normalized) ||
+    (/\b(enviame|enviarme|mandame|mandarme|me\s+mandas|me\s+envias|me\s+envías)\b/.test(normalized) &&
+      /\b(correo|mail|email|gmail)\b/.test(normalized));
   const hasExplicitScheduleCue =
     scheduleNouns ||
     hasReminderVerb ||
@@ -996,6 +1205,7 @@ function detectScheduleNaturalIntent(text: string): ScheduleNaturalIntent {
       action: "create",
       ...(taskTitle ? { taskTitle } : {}),
       ...(automation.instruction ? { automationInstruction: automation.instruction } : {}),
+      ...(automation.domain ? { automationDomain: automation.domain } : {}),
       ...(automation.recurrenceDaily ? { automationRecurrenceDaily: true } : {}),
       ...(parsedSchedule.dueAt ? { dueAt: parsedSchedule.dueAt } : {}),
     };
@@ -1035,15 +1245,46 @@ function parseScheduledNaturalIntentPayload(raw?: string): ScheduledNaturalInten
     return null;
   }
   try {
-    const parsed = JSON.parse(raw) as { instruction?: unknown; recurrence?: unknown };
+    const parsed = JSON.parse(raw) as { instruction?: unknown; recurrence?: unknown; gmailSend?: unknown };
     const instruction = typeof parsed.instruction === "string" ? parsed.instruction.trim() : "";
     if (!instruction) {
       return null;
     }
     const recurrenceRaw = parsed.recurrence as { frequency?: unknown } | undefined;
     const frequency = typeof recurrenceRaw?.frequency === "string" ? recurrenceRaw.frequency.trim().toLowerCase() : "";
+    const gmailRaw = parsed.gmailSend as
+      | {
+          kind?: unknown;
+          to?: unknown;
+          subject?: unknown;
+          body?: unknown;
+          cc?: unknown;
+          bcc?: unknown;
+        }
+      | undefined;
+    const parsedCc = typeof gmailRaw?.cc === "string" ? sanitizeEmailList(gmailRaw.cc) : "";
+    const parsedBcc = typeof gmailRaw?.bcc === "string" ? sanitizeEmailList(gmailRaw.bcc) : "";
+    const gmailSend =
+      gmailRaw &&
+      gmailRaw.kind === "gmail-send" &&
+      typeof gmailRaw.to === "string" &&
+      typeof gmailRaw.subject === "string" &&
+      typeof gmailRaw.body === "string"
+        ? {
+            kind: "gmail-send" as const,
+            to: gmailRaw.to.trim().toLowerCase(),
+            subject: gmailRaw.subject.trim(),
+            body: gmailRaw.body.trim(),
+            ...(parsedCc ? { cc: parsedCc } : {}),
+            ...(parsedBcc ? { bcc: parsedBcc } : {}),
+          }
+        : undefined;
+    if (gmailSend && (!isValidEmailAddress(gmailSend.to) || !gmailSend.subject || !gmailSend.body)) {
+      return null;
+    }
     return {
       instruction,
+      ...(gmailSend ? { gmailSend } : {}),
       ...(frequency === "daily" ? { recurrence: { frequency: "daily" as const } } : {}),
     };
   } catch {
@@ -1179,6 +1420,96 @@ function parseOutputField(stdout: string, field: string): string | undefined {
   const pattern = new RegExp(`^${field}=([^\\r\\n]+)$`, "m");
   const match = stdout.match(pattern);
   return match?.[1]?.trim();
+}
+
+function buildGmailSendCommandFromPayload(payload: ScheduledGmailSendPayload): string {
+  const tokens = [
+    "gmail-api",
+    "send",
+    `to=${payload.to}`,
+    `subject=${payload.subject}`,
+    `body=${payload.body}`,
+    ...(payload.cc ? [`cc=${payload.cc}`] : []),
+    ...(payload.bcc ? [`bcc=${payload.bcc}`] : []),
+  ];
+  return serializeCommandTokens(tokens);
+}
+
+type GmailSendExecutionEvidence = {
+  sent: boolean;
+  messageId?: string;
+  threadId?: string;
+  reason?: string;
+};
+
+function parseGmailSendExecutionEvidence(result: ExecutedCommand): GmailSendExecutionEvidence {
+  if (result.timedOut) {
+    return { sent: false, reason: "timeout en gmail-api send" };
+  }
+  if (!Number.isFinite(result.exitCode ?? Number.NaN) || result.exitCode !== 0) {
+    const stderr = result.stderr.trim();
+    return {
+      sent: false,
+      reason: stderr ? truncateInline(stderr, 240) : `exit=${result.exitCode ?? "null"}`,
+    };
+  }
+  const sent = /\bsent=true\b/i.test(result.stdout);
+  const messageId = parseOutputField(result.stdout, "message_id");
+  const threadId = parseOutputField(result.stdout, "thread_id");
+  if (!sent || !messageId) {
+    return {
+      sent: false,
+      reason: "Falta evidencia sent=true/message_id en salida de gmail-api send.",
+      ...(threadId ? { threadId } : {}),
+    };
+  }
+  return {
+    sent: true,
+    messageId,
+    ...(threadId ? { threadId } : {}),
+  };
+}
+
+function objectiveLooksLikeEmailSend(rawObjective: string): boolean {
+  const normalized = normalizeIntentText(rawObjective);
+  return (
+    /\b(send|envi\w*|mand\w*|correo|mail|email|gmail)\b/.test(normalized) &&
+    /\b(envi\w*|mand\w*|send)\b/.test(normalized) &&
+    /\b(correo|mail|email|gmail)\b/.test(normalized)
+  );
+}
+
+function resolvePendingDraftSendFromHistory(rawObjective: string, history: ExecutedCommand[]): string | null {
+  if (!objectiveLooksLikeEmailSend(rawObjective)) {
+    return null;
+  }
+  let lastDraftId: string | null = null;
+  let hasSuccessfulSend = false;
+
+  for (const item of history) {
+    const command = item.command.trim().toLowerCase();
+    if (command.startsWith("gmail-api send ") || command.startsWith("gmail-api draft send ")) {
+      if (item.exitCode === 0 && /\bsent=true\b/i.test(item.stdout) && Boolean(parseOutputField(item.stdout, "message_id"))) {
+        hasSuccessfulSend = true;
+      }
+      continue;
+    }
+    if (!command.startsWith("gmail-api draft create ")) {
+      continue;
+    }
+    if (item.exitCode !== 0) {
+      continue;
+    }
+    const draftId = parseOutputField(item.stdout, "draft_id");
+    if (draftId) {
+      lastDraftId = draftId;
+    }
+  }
+
+  if (hasSuccessfulSend) {
+    return null;
+  }
+  return lastDraftId;
 }
 
 function parseListedMessageIds(stdout: string): string[] {
@@ -1650,7 +1981,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     reply: (text: string) => Promise<unknown>;
     plannerAttachmentHint?: string;
     rememberUserSource?: string;
-  }): Promise<void> => {
+  }): Promise<{ status: "success" | "blocked" | "incomplete"; summary: string }> => {
     const objectiveWithHints = params.plannerAttachmentHint
       ? `${params.objectiveRaw}\n\n${params.plannerAttachmentHint}`
       : params.objectiveRaw;
@@ -1694,19 +2025,31 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     let lastCommandsSignature = "";
     let repeatedCommandsCount = 0;
     let executedCommandsTotal = 0;
+    const forcedDraftSendAttempted = new Set<string>();
     for (let iteration = 1; iteration <= proxyConfig.maxIterations; iteration += 1) {
       const gmailContext = getGmailChatContext(gmailContextByChat, params.chatId);
       const gmailContextBlock = buildGmailPlannerContextBlock(gmailContext);
       const objectiveForPlanner = gmailContextBlock ? `${objective}\n\n${gmailContextBlock}` : objective;
-      const plan = await planner.plan({
-        objective: objectiveForPlanner,
-        agent: params.activeAgent,
-        history,
-        iteration,
-        memoryHits,
-        recentConversation,
-        webApi: webApi?.plannerContext ?? null,
-      });
+      const pendingDraftId = resolvePendingDraftSendFromHistory(objective, history);
+      const shouldForceDraftSend = Boolean(pendingDraftId && !forcedDraftSendAttempted.has(pendingDraftId));
+      const plan: PlannerResponse = shouldForceDraftSend
+        ? {
+            action: "commands",
+            explanation: "Se detectó un draft previo sin envío confirmado. Fuerzo `gmail-api draft send` para completar el objetivo.",
+            commands: [`gmail-api draft send ${pendingDraftId}`],
+          }
+        : await planner.plan({
+            objective: objectiveForPlanner,
+            agent: params.activeAgent,
+            history,
+            iteration,
+            memoryHits,
+            recentConversation,
+            webApi: webApi?.plannerContext ?? null,
+          });
+      if (shouldForceDraftSend && pendingDraftId) {
+        forcedDraftSendAttempted.add(pendingDraftId);
+      }
       logInfo(
         `Telegram plan chat=${params.chatId} user=${params.userId ?? 0} iter=${iteration} action=${plan.action} commands=${plan.commands?.length ?? 0}`,
       );
@@ -1720,7 +2063,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: replyText,
           source: "proxy-telegram:reply",
         });
-        return;
+        return { status: "incomplete", summary: replyText };
       }
 
       if (plan.action === "done") {
@@ -1732,7 +2075,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: doneText,
           source: "proxy-telegram:done",
         });
-        return;
+        return { status: "success", summary: doneText };
       }
 
       const commands = plan.commands ?? [];
@@ -1746,7 +2089,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: textLimit,
           source: "proxy-telegram:limit",
         });
-        return;
+        return { status: "incomplete", summary: textLimit };
       }
       const commandsToRun = commands.slice(0, remaining);
       const rewrittenCommandsToRun = commandsToRun.map((item) => rewriteGmailCommandWithContext(item, gmailContext));
@@ -1811,7 +2154,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: verification.summary,
           source: "proxy-telegram:verify-success",
         });
-        return;
+        return { status: "success", summary: verification.summary };
       }
       if (verification.status === "blocked") {
         await params.reply(verification.summary);
@@ -1821,7 +2164,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: verification.summary,
           source: "proxy-telegram:verify-blocked",
         });
-        return;
+        return { status: "blocked", summary: verification.summary };
       }
 
       const commandsSignature = JSON.stringify(rewrittenCommandsToRun.map((item) => item.trim()));
@@ -1848,7 +2191,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: repeatedCmdText,
           source: "proxy-telegram:repeat-command-guard",
         });
-        return;
+        return { status: "incomplete", summary: repeatedCmdText };
       }
 
       const guardResult = nextLoopGuardState(guard, rewrittenCommandsToRun, results);
@@ -1863,7 +2206,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           text: loopText,
           source: "proxy-telegram:loop-guard",
         });
-        return;
+        return { status: "incomplete", summary: loopText };
       }
     }
 
@@ -1875,6 +2218,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
       text: maxIterText,
       source: "proxy-telegram:max-iterations",
     });
+    return { status: "incomplete", summary: maxIterText };
   };
 
   const maybeHandleNaturalScheduleInstruction = async (params: {
@@ -1888,7 +2232,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
       return false;
     }
     logInfo(
-      `Telegram schedule-intent chat=${params.chatId} user=${params.userId ?? 0} action=${intent.action} due=${intent.dueAt?.toISOString() ?? "-"} hasAutomation=${String(Boolean(intent.automationInstruction))}`,
+      `Telegram schedule-intent chat=${params.chatId} user=${params.userId ?? 0} action=${intent.action} due=${intent.dueAt?.toISOString() ?? "-"} hasAutomation=${String(Boolean(intent.automationInstruction))} domain=${intent.automationDomain ?? "-"}`,
     );
 
     try {
@@ -1954,6 +2298,29 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
         }
 
         const hasAutomationInstruction = Boolean(intent.automationInstruction?.trim());
+        const automationPayload = hasAutomationInstruction
+          ? buildScheduledNaturalIntentPayload({
+              rawText: params.text,
+              instruction: intent.automationInstruction?.trim() ?? "",
+              taskTitle: title,
+              automationDomain: intent.automationDomain,
+              recurrenceDaily: intent.automationRecurrenceDaily,
+            })
+          : null;
+        if (hasAutomationInstruction && !automationPayload?.payload) {
+          const text =
+            automationPayload?.errorText ??
+            "No pude estructurar la automatización. Reescribe con destinatario y mensaje explícitos.";
+          await params.reply(text);
+          await rememberAssistant({
+            chatId: params.chatId,
+            userId: params.userId,
+            text,
+            source: "proxy-telegram:schedule-error",
+          });
+          return true;
+        }
+
         const created = await scheduledTasks.createTask({
           chatId: params.chatId,
           ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
@@ -1962,10 +2329,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           ...(hasAutomationInstruction ? { deliveryKind: "natural-intent" as const } : {}),
           ...(hasAutomationInstruction
             ? {
-                deliveryPayload: JSON.stringify({
-                  instruction: intent.automationInstruction?.trim() || "",
-                  ...(intent.automationRecurrenceDaily ? { recurrence: { frequency: "daily" as const } } : {}),
-                }),
+                deliveryPayload: JSON.stringify(automationPayload?.payload),
               }
             : {}),
         });
@@ -1977,6 +2341,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
           `detalle: ${created.title}`,
           ...(hasAutomationInstruction ? [`accion: ${intent.automationInstruction?.trim()}`] : []),
+          ...(automationPayload?.responseHints ?? []),
           ...(intent.automationRecurrenceDaily ? ["recurrencia: diaria"] : []),
         ].join("\n");
         await params.reply(responseText);
@@ -2177,6 +2542,23 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
         return;
       }
 
+      const automationPayload = hasAutomationInstruction
+        ? buildScheduledNaturalIntentPayload({
+            rawText: restRaw,
+            instruction: automation.instruction?.trim() ?? "",
+            taskTitle: hasAutomationInstruction ? sanitizeScheduleTitle(`Automatizacion: ${automation.instruction}`) : detail,
+            automationDomain: automation.domain,
+            recurrenceDaily: automation.recurrenceDaily,
+          })
+        : null;
+      if (hasAutomationInstruction && !automationPayload?.payload) {
+        await params.reply(
+          automationPayload?.errorText ??
+            "No pude estructurar la automatización. Reescribe con destinatario y mensaje explícitos.",
+        );
+        return;
+      }
+
       const created = await scheduledTasks.createTask({
         chatId: params.chatId,
         ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
@@ -2185,10 +2567,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
         ...(hasAutomationInstruction ? { deliveryKind: "natural-intent" as const } : {}),
         ...(hasAutomationInstruction
           ? {
-              deliveryPayload: JSON.stringify({
-                instruction: automation.instruction,
-                ...(automation.recurrenceDaily ? { recurrence: { frequency: "daily" as const } } : {}),
-              }),
+              deliveryPayload: JSON.stringify(automationPayload?.payload),
             }
           : {}),
       });
@@ -2199,6 +2578,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
           `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
           `detalle: ${created.title}`,
           ...(hasAutomationInstruction ? [`accion: ${automation.instruction}`] : []),
+          ...(automationPayload?.responseHints ?? []),
           ...(automation.recurrenceDaily ? ["recurrencia: diaria"] : []),
         ].join("\n"),
       );
@@ -2310,22 +2690,64 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
             if (!instruction) {
               throw new Error("No hay instrucción para la automatización programada.");
             }
+            const payloadSafe = payload;
 
-            await bot.api.sendMessage(
-              task.chatId,
-              ["Automatización programada en curso.", `id: ${task.id}`, `accion: ${instruction}`].join("\n"),
-            );
+            if (payloadSafe?.gmailSend) {
+              const command = buildGmailSendCommandFromPayload(payloadSafe.gmailSend);
+              const activeAgent = resolveActiveAgent(task.chatId);
+              await bot.api.sendMessage(
+                task.chatId,
+                [
+                  "Automatización Gmail programada en curso.",
+                  `id: ${task.id}`,
+                  `to: ${payloadSafe.gmailSend.to}`,
+                  `subject: ${payloadSafe.gmailSend.subject}`,
+                ].join("\n"),
+              );
+              logInfo(`Telegram schedule gmail-send start chat=${task.chatId} task=${task.id} command="${command}"`);
+              const results = await executor.runSequence(activeAgent, [command]);
+              const sendResult = results[0];
+              if (!sendResult) {
+                throw new Error("No hubo resultado al ejecutar gmail-api send.");
+              }
+              const evidence = parseGmailSendExecutionEvidence(sendResult);
+              const textOutput = formatExecution(sendResult);
+              for (const chunk of chunkText(textOutput)) {
+                await bot.api.sendMessage(task.chatId, chunk);
+              }
+              if (!evidence.sent) {
+                throw new Error(`No se confirmó envío real del email. ${evidence.reason ?? "Sin evidencia sent=true."}`.trim());
+              }
+              logInfo(
+                `Telegram schedule gmail-send ok chat=${task.chatId} task=${task.id} message=${evidence.messageId ?? "-"} thread=${evidence.threadId ?? "-"}`,
+              );
+              await bot.api.sendMessage(
+                task.chatId,
+                `Email enviado por tarea programada.\nmessage_id: ${evidence.messageId}\nthread_id: ${evidence.threadId ?? "-"}`,
+              );
+            } else {
+              await bot.api.sendMessage(
+                task.chatId,
+                ["Automatización programada en curso.", `id: ${task.id}`, `accion: ${instruction}`].join("\n"),
+              );
 
-            await runObjectiveExecution({
-              chatId: task.chatId,
-              ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
-              activeAgent: resolveActiveAgent(task.chatId),
-              objectiveRaw: instruction,
-              reply: async (text: string) => bot.api.sendMessage(task.chatId, text),
-              rememberUserSource: undefined,
-            });
+              const runOutcome = await runObjectiveExecution({
+                chatId: task.chatId,
+                ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
+                activeAgent: resolveActiveAgent(task.chatId),
+                objectiveRaw: instruction,
+                reply: async (text: string) => bot.api.sendMessage(task.chatId, text),
+                rememberUserSource: undefined,
+              });
+              logInfo(
+                `Telegram schedule objective outcome chat=${task.chatId} task=${task.id} status=${runOutcome.status} summary="${runOutcome.summary.slice(0, 160)}"`,
+              );
+              if (runOutcome.status !== "success") {
+                throw new Error(`No se confirmó ejecución exitosa: ${runOutcome.summary}`);
+              }
+            }
 
-            if (payload?.recurrence?.frequency === "daily") {
+            if (payloadSafe?.recurrence?.frequency === "daily") {
               const nextDueAt = buildNextDailyOccurrence(task.dueAt, new Date());
               const createdNext = await scheduledTasks.createTask({
                 chatId: task.chatId,
