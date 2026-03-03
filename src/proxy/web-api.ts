@@ -10,6 +10,14 @@ export type ProxyWebApiPlannerContext = {
   bearerToken?: string;
 };
 
+function errorCodeOf(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "";
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : "";
+}
+
 export class ProxyWebApiServer {
   constructor(
     private readonly server: Server | null,
@@ -208,11 +216,18 @@ export async function startProxyWebApiServer(): Promise<ProxyWebApiServer | null
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (/EADDRINUSE/.test(message)) {
+    const code = errorCodeOf(error);
+    if (code === "EADDRINUSE" || /EADDRINUSE/.test(message)) {
       logInfo(
         `Proxy Web API ya está ocupando ${proxyConfig.webApiHost}:${proxyConfig.webApiPort}; reutilizando endpoint existente.`,
       );
       return new ProxyWebApiServer(null, plannerContext);
+    }
+    if (code === "EACCES" || code === "EPERM" || /EACCES|EPERM/.test(message)) {
+      logError(
+        `Proxy Web API no pudo abrir ${proxyConfig.webApiHost}:${proxyConfig.webApiPort} (${code || "permiso"}). Continúo sin Web API local.`,
+      );
+      return null;
     }
     throw error;
   }

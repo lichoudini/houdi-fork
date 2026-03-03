@@ -3415,12 +3415,22 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
 }
 
 export async function runProxyTelegramFromProcess(): Promise<void> {
-  try {
-    await startTerminalProxyTelegramBot();
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logError(message);
-    process.stderr.write(`Error: ${message}\n`);
-    process.exitCode = 1;
+  let attempt = 0;
+  while (true) {
+    try {
+      await startTerminalProxyTelegramBot();
+      logError("Proxy Telegram finalizó inesperadamente; reiniciando...");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      logError(`Proxy Telegram crash: ${message}`);
+      process.stderr.write(`Error: ${message}\n`);
+    }
+
+    attempt += 1;
+    const retryMs = Math.min(30_000, Math.max(2_000, attempt * 2_000));
+    logInfo(`Reintentando inicio de Telegram en ${retryMs}ms (intento ${attempt}).`);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, retryMs);
+    });
   }
 }
