@@ -16,6 +16,7 @@ import { logError, logInfo } from "../logger.js";
 import { ScheduledTaskSqliteService } from "../scheduled-tasks-sqlite.js";
 import { proxyConfig } from "./config.js";
 import { nextLoopGuardState } from "./loop-guard.js";
+import { buildObjectiveFromUserTextAndReplyQuote, extractReplyTextFromTelegramMessage } from "./reply-quote.js";
 import { createProxyRuntime } from "./runtime.js";
 import type { ExecutedCommand, PlannerResponse } from "./types.js";
 import { presentListingResultForWorkspace, resolveWorkspaceHashtagsInText } from "./workspace-listing.js";
@@ -3206,8 +3207,13 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     if (!text) {
       return;
     }
+    const replyQuote = extractReplyTextFromTelegramMessage((ctx.message as { reply_to_message?: unknown }).reply_to_message);
+    const textWithReplyQuote = buildObjectiveFromUserTextAndReplyQuote(text, replyQuote);
     const preview = text.replace(/\s+/g, " ").slice(0, 140);
     logInfo(`Telegram inbound chat=${chatId} user=${userId} text="${preview}"`);
+    if (replyQuote) {
+      logInfo(`Telegram inbound-reply-quote chat=${chatId} user=${userId} chars=${replyQuote.length}`);
+    }
     const normalizedText = normalizeTelegramCommand(text);
 
     let activeAgent = resolveActiveAgent(chatId);
@@ -3258,7 +3264,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     const naturalScheduleHandled = await maybeHandleNaturalScheduleInstruction({
       chatId,
       userId,
-      text,
+      text: textWithReplyQuote,
       reply: async (replyText: string) => ctx.reply(replyText),
     });
     if (naturalScheduleHandled) {
@@ -3382,7 +3388,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
       chatId,
       userId,
       activeAgent,
-      objectiveRaw: text,
+      objectiveRaw: textWithReplyQuote,
       plannerAttachmentHint,
       rememberUserSource: "proxy-telegram:user",
       reply: async (replyText: string) => ctx.reply(replyText),
