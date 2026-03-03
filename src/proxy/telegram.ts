@@ -16,7 +16,7 @@ import { logError, logInfo } from "../logger.js";
 import { ScheduledTaskSqliteService } from "../scheduled-tasks-sqlite.js";
 import { proxyConfig } from "./config.js";
 import { nextLoopGuardState } from "./loop-guard.js";
-import { buildObjectiveFromUserTextAndReplyQuote, extractReplyTextFromTelegramMessage } from "./reply-quote.js";
+import { buildObjectiveFromUserTextAndReplyQuote, extractReplyTextFromTelegramEnvelope } from "./reply-quote.js";
 import { createProxyRuntime } from "./runtime.js";
 import type { ExecutedCommand, PlannerResponse } from "./types.js";
 import { presentListingResultForWorkspace, resolveWorkspaceHashtagsInText } from "./workspace-listing.js";
@@ -3207,7 +3207,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     if (!text) {
       return;
     }
-    const replyQuote = extractReplyTextFromTelegramMessage((ctx.message as { reply_to_message?: unknown }).reply_to_message);
+    const replyQuote = extractReplyTextFromTelegramEnvelope(ctx.message);
     const textWithReplyQuote = buildObjectiveFromUserTextAndReplyQuote(text, replyQuote);
     const preview = text.replace(/\s+/g, " ").slice(0, 140);
     logInfo(`Telegram inbound chat=${chatId} user=${userId} text="${preview}"`);

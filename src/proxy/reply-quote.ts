@@ -42,6 +42,25 @@ export function extractReplyTextFromTelegramMessage(replyMessage: unknown, maxCh
   return truncateInline(joined, maxChars);
 }
 
+export function extractReplyTextFromTelegramEnvelope(message: unknown, maxChars = 4000): string {
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+  const payload = message as {
+    reply_to_message?: unknown;
+    quote?: { text?: unknown };
+  };
+  const fromReply = extractReplyTextFromTelegramMessage(payload.reply_to_message, maxChars);
+  if (fromReply) {
+    return fromReply;
+  }
+  const quoteText = typeof payload.quote?.text === "string" ? payload.quote.text.trim() : "";
+  if (!quoteText) {
+    return "";
+  }
+  return truncateInline(quoteText, maxChars);
+}
+
 export function buildObjectiveFromUserTextAndReplyQuote(userText: string, replyQuote: string): string {
   const objective = userText.trim();
   const quoted = replyQuote.trim();

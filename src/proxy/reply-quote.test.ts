@@ -1,12 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildObjectiveFromUserTextAndReplyQuote, extractReplyTextFromTelegramMessage } from "./reply-quote.js";
+import {
+  buildObjectiveFromUserTextAndReplyQuote,
+  extractReplyTextFromTelegramEnvelope,
+  extractReplyTextFromTelegramMessage,
+} from "./reply-quote.js";
 
 test("extracts quoted text from telegram reply message", () => {
   const output = extractReplyTextFromTelegramMessage({
     text: "Resumen de noticias de Boca Juniors",
   });
   assert.equal(output, "Resumen de noticias de Boca Juniors");
+});
+
+test("extracts quoted text from telegram envelope quote fallback", () => {
+  const output = extractReplyTextFromTelegramEnvelope({
+    quote: { text: "Solo este párrafo citado" },
+  });
+  assert.equal(output, "Solo este párrafo citado");
 });
 
 test("builds email objective using quoted content as body hint", () => {
