@@ -966,9 +966,43 @@ function buildScheduledGmailSendPayload(params: {
         ? fallbackIntent
         : null;
   if (!intent) {
+    const fallbackToCandidate =
+      parsers.extractEmailAddresses(`${params.rawText} ${params.instruction}`)[0] ??
+      inferDefaultSelfEmailRecipient(params.rawText) ??
+      inferDefaultSelfEmailRecipient(params.instruction);
+    const fallbackTo = (fallbackToCandidate ?? "").trim().toLowerCase();
+    if (!fallbackTo || !isValidEmailAddress(fallbackTo)) {
+      return {
+        errorText:
+          "No pude estructurar el envío de email. Formato sugerido: 'programa enviar mail a usuario@dominio.com asunto: ... mensaje: ...'.",
+      };
+    }
+
+    const fallbackBodySeed =
+      params.instruction.trim() ||
+      params.taskTitle.trim() ||
+      params.rawText.trim();
+    const fallbackBody = truncateInline(
+      fallbackBodySeed
+        .replace(
+          /\b(?:enviar|enviame|enviarme|mandar|mandame|mandarme|programar|programa|mail|email|correo|gmail)\b/gi,
+          " ",
+        )
+        .replace(/\b(?:a|para)\s+[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim() || fallbackBodySeed,
+      8_000,
+    );
+    const fallbackSubject = /\b(noticias?|news|novedades?|actualidad|titulares?)\b/i.test(fallbackBody)
+      ? "Resumen programado"
+      : "Recordatorio programado";
     return {
-      errorText:
-        "No pude estructurar el envío de email. Formato sugerido: 'programa enviar mail a usuario@dominio.com asunto: ... mensaje: ...'.",
+      payload: {
+        kind: "gmail-send",
+        to: fallbackTo,
+        subject: fallbackSubject,
+        body: fallbackBody,
+      },
     };
   }
 
