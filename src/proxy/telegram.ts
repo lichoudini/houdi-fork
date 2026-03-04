@@ -546,6 +546,22 @@ const SCHEDULE_MONTH_TO_INDEX: Record<string, number> = {
   diciembre: 11,
 };
 
+const SCHEDULE_SPOKEN_HOUR_TO_NUMBER: Record<string, number> = {
+  un: 1,
+  una: 1,
+  dos: 2,
+  tres: 3,
+  cuatro: 4,
+  cinco: 5,
+  seis: 6,
+  siete: 7,
+  ocho: 8,
+  nueve: 9,
+  diez: 10,
+  once: 11,
+  doce: 12,
+};
+
 function normalizeIntentText(text: string): string {
   return text
     .normalize("NFD")
@@ -616,11 +632,44 @@ function parseScheduleRelativeDateTime(normalized: string, now: Date): Date | nu
 }
 
 function parseScheduleTime(normalized: string): { hour: number; minute: number } | null {
+  const applyDayPeriod = (hourInput: number, periodRaw?: string): number | null => {
+    if (!Number.isFinite(hourInput) || hourInput < 0 || hourInput > 23) {
+      return null;
+    }
+    const period = (periodRaw ?? "").toLowerCase();
+    if (!period) {
+      return hourInput;
+    }
+    if (period === "tarde" || period === "noche") {
+      return hourInput < 12 ? hourInput + 12 : hourInput;
+    }
+    if (period === "manana" || period === "madrugada") {
+      if (hourInput === 12) {
+        return 0;
+      }
+      return hourInput;
+    }
+    return hourInput;
+  };
+
   if (/\bmediodia\b/.test(normalized)) {
     return { hour: 12, minute: 0 };
   }
   if (/\bmedianoche\b/.test(normalized)) {
     return { hour: 0, minute: 0 };
+  }
+
+  const spokenHalf = normalized.match(
+    /\ba\s+las\s+(un|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+media(?:\s+de\s+la\s+(manana|tarde|noche|madrugada))?\b/,
+  );
+  if (spokenHalf) {
+    const word = spokenHalf[1] ?? "";
+    const rawHour = SCHEDULE_SPOKEN_HOUR_TO_NUMBER[word];
+    const hour = applyDayPeriod(rawHour, spokenHalf[2] ?? "");
+    if (typeof hour === "number") {
+      return { hour, minute: 30 };
+    }
+    return null;
   }
 
   const hhmm = normalized.match(/\b(?:a\s+las\s+)?(\d{1,2})(?::|\.)(\d{2})\s*(am|pm)?\s*(?:h|hs)?\b/);
@@ -645,6 +694,16 @@ function parseScheduleTime(normalized: string): { hour: number; minute: number }
     if (hour < 0 || hour > 23) {
       return null;
     }
+    const dayPeriod = normalized.match(
+      /\b(?:a\s+las\s+)?\d{1,2}(?::|\.)\d{2}\s*(?:am|pm)?\s*(?:de\s+la\s+(manana|tarde|noche|madrugada))\b/,
+    )?.[1];
+    if (!ampm && dayPeriod) {
+      const adjusted = applyDayPeriod(hour, dayPeriod);
+      if (typeof adjusted !== "number") {
+        return null;
+      }
+      hour = adjusted;
+    }
     return { hour, minute };
   }
 
@@ -664,10 +723,14 @@ function parseScheduleTime(normalized: string): { hour: number; minute: number }
     return { hour, minute: 0 };
   }
 
-  const simple = normalized.match(/\ba\s+las\s+(\d{1,2})\b/);
+  const simple = normalized.match(/\ba\s+las\s+(\d{1,2})(?:\s+de\s+la\s+(manana|tarde|noche|madrugada))?\b/);
   if (simple) {
-    const hour = Number.parseInt(simple[1] ?? "", 10);
-    if (!Number.isFinite(hour) || hour < 0 || hour > 23) {
+    const hourRaw = Number.parseInt(simple[1] ?? "", 10);
+    if (!Number.isFinite(hourRaw) || hourRaw < 0 || hourRaw > 23) {
+      return null;
+    }
+    const hour = applyDayPeriod(hourRaw, simple[2] ?? "");
+    if (typeof hour !== "number") {
       return null;
     }
     return { hour, minute: 0 };
@@ -845,6 +908,11 @@ function stripScheduleTemporalPhrases(text: string): string {
     .replace(/\bmediod[ií]a\b/gi, " ")
     .replace(/\bmedianoche\b/gi, " ")
     .replace(/\b(?:a\s+las\s+)?(\d{1,2})(?::|\.)(\d{2})\s*(?:am|pm)?\s*(?:h|hs)?\b/gi, " ")
+    .replace(
+      /\ba\s+las\s+(?:un|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)\s+y\s+media(?:\s+de\s+la\s+(?:manana|mañana|tarde|noche|madrugada))?\b/gi,
+      " ",
+    )
+    .replace(/\ba\s+las\s+(\d{1,2})\s+de\s+la\s+(?:manana|mañana|tarde|noche|madrugada)\b/gi, " ")
     .replace(/(?<![:.])\b(?:a\s+las\s+)?(\d{1,2})\s*(?:h|hs)\b/gi, " ")
     .replace(/\b(?:a\s+las\s+)?(\d{1,2})\s*(?:am|pm)\b/gi, " ")
     .replace(/\ba\s+las\s+(\d{1,2})\b/gi, " ")
@@ -3100,11 +3168,22 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
         source: "proxy-telegram:audio-transcript",
       });
 
+      const objectiveRaw = caption ? `${transcript}\n\n${caption}` : transcript;
+      const naturalScheduleHandled = await maybeHandleNaturalScheduleInstruction({
+        chatId,
+        userId,
+        text: objectiveRaw,
+        reply: async (replyText: string) => ctx.reply(replyText),
+      });
+      if (naturalScheduleHandled) {
+        return;
+      }
+
       await runObjectiveExecution({
         chatId,
         userId,
         activeAgent,
-        objectiveRaw: caption ? `${transcript}\n\n${caption}` : transcript,
+        objectiveRaw,
         rememberUserSource: "proxy-telegram:audio-transcript-user",
         reply: async (replyText: string) => ctx.reply(replyText),
       });
@@ -3174,11 +3253,22 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
         source: "proxy-telegram:audio-transcript",
       });
 
+      const objectiveRaw = caption ? `${transcript}\n\n${caption}` : transcript;
+      const naturalScheduleHandled = await maybeHandleNaturalScheduleInstruction({
+        chatId,
+        userId,
+        text: objectiveRaw,
+        reply: async (replyText: string) => ctx.reply(replyText),
+      });
+      if (naturalScheduleHandled) {
+        return;
+      }
+
       await runObjectiveExecution({
         chatId,
         userId,
         activeAgent,
-        objectiveRaw: caption ? `${transcript}\n\n${caption}` : transcript,
+        objectiveRaw,
         rememberUserSource: "proxy-telegram:audio-transcript-user",
         reply: async (replyText: string) => ctx.reply(replyText),
       });
