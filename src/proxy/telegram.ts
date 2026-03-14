@@ -2,9 +2,14 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { createReadStream } from "node:fs";
+import { ChatMessageQueue } from "../chat-message-queue.js";
+import { DocumentReader } from "../document-reader.js";
+import { GmailAccountService } from "../gmail-account.js";
 import { Bot, GrammyError, HttpError, InputFile, type Context } from "grammy";
 import OpenAI from "openai";
 import type { AgentProfile } from "../agents.js";
+import { AgentPolicyEngine } from "../agent-policy.js";
+import { WorkspaceFilesService } from "../domains/workspace/workspace-files-service.js";
 import { detectGmailNaturalIntent } from "../domains/gmail/intents.js";
 import { normalizeRecipientName } from "../domains/gmail/recipients-manager.js";
 import { createGmailTextParsers } from "../domains/gmail/text-parsers.js";
@@ -12,13 +17,34 @@ import {
   detectScheduledAutomationIntent,
   type ScheduledAutomationDomain,
 } from "../domains/schedule/automation-intent.js";
-import { logError, logInfo } from "../logger.js";
+import { logError, logInfo, logWarn } from "../logger.js";
 import { ScheduledTaskSqliteService } from "../scheduled-tasks-sqlite.js";
+import { type WebSearchResult, WebBrowser } from "../web-browser.js";
+import { humanizeObjectivePhase } from "./agentic-helpers.js";
+import {
+  createDeterministicIntentHandler,
+  createNaturalScheduleHandler,
+  createProxyActionRegistry,
+} from "./domain-action-handlers.js";
+import {
+  updateSemanticReferences,
+} from "./clarification-engine.js";
 import { proxyConfig } from "./config.js";
-import { nextLoopGuardState } from "./loop-guard.js";
+import { ProxyCapabilityPolicy, parseApprovalReply } from "./capability-policy.js";
+import { IntentBiasStore } from "./intent-bias.js";
+import { buildIntentIr, stripQuotedExecutionNoise, type IntentIr } from "./intent-ir.js";
+import { ProxyObjectiveStateStore, type ObjectivePhase, type ObjectiveSlots } from "./objective-state.js";
+import { createObjectiveExecutionRunner, type ObjectiveRunController } from "./objective-execution.js";
+import { IntentTelemetry } from "./intent-telemetry.js";
 import { buildObjectiveFromUserTextAndReplyQuote, extractReplyTextFromTelegramEnvelope } from "./reply-quote.js";
 import { createProxyRuntime } from "./runtime.js";
 import type { ExecutedCommand, PlannerResponse } from "./types.js";
+import {
+  buildExecutionReplyText,
+  buildFriendlyGmailSendText,
+  buildFriendlyObjectiveStatusText,
+  pickHeartbeatMessage,
+} from "./user-facing.js";
 import { presentListingResultForWorkspace, resolveWorkspaceHashtagsInText } from "./workspace-listing.js";
 
 const IMAGE_EXTENSIONS = new Set([
@@ -35,6 +61,121 @@ const IMAGE_EXTENSIONS = new Set([
 ]);
 
 const MAX_TELEGRAM_UPLOAD_BYTES = 49_000_000;
+const SIMPLE_TEXT_EXTENSIONS = new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log", ".yaml", ".yml", ".xml", ".html", ".htm"]);
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 1024) {
+    return `${Math.max(0, Math.floor(bytes || 0))}b`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)}kb`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)}mb`;
+}
+
+function normalizeWorkspaceRelativePath(raw: string): string {
+  const value = raw.trim().replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/{2,}/g, "/");
+  if (!value || value === ".") {
+    return "";
+  }
+  return value.replace(/^workspace\//i, "").replace(/^\.\/+/, "");
+}
+
+function isSimpleTextFilePath(relativePath: string): boolean {
+  return SIMPLE_TEXT_EXTENSIONS.has(path.extname(relativePath).toLowerCase());
+}
+
+async function safePathExists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseBooleanEnv(raw: string | undefined, defaultValue: boolean): boolean {
+  if (typeof raw !== "string") {
+    return defaultValue;
+  }
+  const normalized = raw.trim().toLowerCase();
+  if (["1", "true", "yes", "on", "si", "sí", "s"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off", "n"].includes(normalized)) {
+    return false;
+  }
+  return defaultValue;
+}
+
+function createWorkspaceFilesService(agent: AgentProfile): WorkspaceFilesService {
+  const workspaceRoot = path.resolve(process.cwd(), agent.cwd);
+  return new WorkspaceFilesService(
+    workspaceRoot,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    formatBytes,
+    safePathExists,
+    SIMPLE_TEXT_EXTENSIONS,
+  );
+}
+
+function createDocumentReader(agent: AgentProfile): DocumentReader {
+  const workspaceRoot = path.resolve(process.cwd(), agent.cwd);
+  return new DocumentReader({
+    baseDir: workspaceRoot,
+    maxFileBytes: 20_000_000,
+    maxTextChars: 20_000,
+  });
+}
+
+async function expandWorkspacePathForDirectUse(
+  service: WorkspaceFilesService,
+  rawPath: string | undefined,
+  options?: { allowFuzzy?: boolean; extensionFilters?: string[] },
+): Promise<string> {
+  const normalized = normalizeWorkspaceRelativePath(rawPath ?? "");
+  if (!normalized) {
+    return "";
+  }
+  if (service.hasEllipsisPathPlaceholder(normalized)) {
+    const resolved = await service.resolveEllipsisPathPlaceholder(normalized);
+    return resolved.resolvedPath;
+  }
+  if (options?.allowFuzzy) {
+    const resolved = await service.resolveExistingPathCandidate(normalized, options);
+    if (resolved.ambiguous) {
+      throw new Error(`Ruta ambigua. Coincidencias: ${resolved.matches.slice(0, 8).join(", ")}`);
+    }
+    if (resolved.matches.length > 0) {
+      return resolved.resolvedPath;
+    }
+  }
+  return normalized;
+}
+
+function buildWebResultsListText(query: string, hits: WebSearchResult[]): string {
+  const lines = [`Resultados web para: ${query}`];
+  hits.forEach((hit, index) => {
+    lines.push(`${index + 1}. ${truncateInline(hit.title || hit.url, 140)}`);
+    lines.push(`url: ${hit.url}`);
+    if (hit.snippet.trim()) {
+      lines.push(`detalle: ${truncateInline(hit.snippet, 220)}`);
+    }
+  });
+  return lines.join("\n");
+}
+
+function createGmailAccountService(): GmailAccountService {
+  return new GmailAccountService({
+    enabled: parseBooleanEnv(process.env.ENABLE_GMAIL_ACCOUNT, Boolean(process.env.GMAIL_REFRESH_TOKEN)),
+    clientId: process.env.GMAIL_CLIENT_ID?.trim(),
+    clientSecret: process.env.GMAIL_CLIENT_SECRET?.trim(),
+    refreshToken: process.env.GMAIL_REFRESH_TOKEN?.trim(),
+    accountEmail: process.env.GMAIL_ACCOUNT_EMAIL?.trim(),
+    maxResults: Number.parseInt(process.env.GMAIL_MAX_RESULTS ?? "", 10) || 10,
+  });
+}
 
 function chunkText(input: string, maxChars = 3500): string[] {
   const text = input.trim();
@@ -48,20 +189,6 @@ function chunkText(input: string, maxChars = 3500): string[] {
     cursor += maxChars;
   }
   return out;
-}
-
-function formatExecution(result: ExecutedCommand): string {
-  const lines: string[] = [`$ ${result.command}`];
-  lines.push(`[exit ${result.exitCode ?? "null"}${result.timedOut ? ", timeout" : ""}]`);
-  if (result.stdout.trim()) {
-    lines.push("stdout:");
-    lines.push(result.stdout.trim().slice(0, 2500));
-  }
-  if (result.stderr.trim()) {
-    lines.push("stderr:");
-    lines.push(result.stderr.trim().slice(0, 1800));
-  }
-  return lines.join("\n");
 }
 
 function isAllowedUser(userId: number): boolean {
@@ -90,11 +217,13 @@ function formatHelp(activeAgent: AgentProfile): string {
     "/task del <n|id|last>",
     "/task edit <n|id> | <nuevo cuando> | <nuevo detalle opcional>",
     "/adjuntar <archivo|#tag> - enviar adjunto desde workspace",
+    "/status - ver estado del objetivo actual o último",
+    "/cancel - cancelar el objetivo activo",
     "",
     "Luego escribe un objetivo natural y el agente:",
-    "1) te explica el plan",
-    "2) ejecuta comandos en terminal",
-    "3) te devuelve salida real",
+    "1) piensa una ruta razonable",
+    "2) hace el trabajo necesario",
+    "3) te devuelve un resultado entendible",
     "",
     "Tambien puedes adjuntar imagenes para analisis.",
     "Tambien puedes enviar audios para transcribir y ejecutar acciones.",
@@ -569,6 +698,54 @@ function normalizeIntentText(text: string): string {
     .toLowerCase()
     .replace(/\s+/g, " ")
     .trim();
+}
+
+type WorkspaceDocumentCreateIntent = {
+  shouldHandle: boolean;
+  filePath?: string;
+  content?: string;
+  missing?: "path" | "content";
+};
+
+function detectWorkspaceDocumentCreateIntent(rawText: string): WorkspaceDocumentCreateIntent {
+  const original = stripQuotedExecutionNoise(rawText.trim());
+  if (!original) {
+    return { shouldHandle: false };
+  }
+
+  const normalized = normalizeIntentText(original);
+  const hasCreateVerb =
+    /\b(crea|crear|genera|generar|escribe|escribir|arma|armar|guardar|guarda|haceme|hazme|hacer)\b/.test(normalized);
+  const hasDocumentCue = /\b(archivo|documento|txt|texto|fichero|nota)\b/.test(normalized);
+  if (!hasCreateVerb || !hasDocumentCue) {
+    return { shouldHandle: false };
+  }
+
+  const explicitPath =
+    original.match(/\b([A-Za-z0-9][A-Za-z0-9._/-]*\.(?:txt|md|json|csv|log))\b/)?.[1] ??
+    original.match(/\b(?:archivo|documento|fichero)\s+([A-Za-z0-9][A-Za-z0-9._/-]*)\b/i)?.[1];
+  const filePathBase = (explicitPath ?? "").trim().replace(/^['"`]+|['"`]+$/g, "").replace(/[),.;:!?]+$/g, "");
+  const filePath = filePathBase && /\.[A-Za-z0-9]+$/.test(filePathBase) ? filePathBase : filePathBase ? `${filePathBase}.txt` : "";
+
+  const labeledContent =
+    original.match(/\b(?:contenido|texto|body)\s*[:=-]\s*([\s\S]+)$/i)?.[1] ??
+    original.match(/\bcon(?:\s+el)?\s+contenido\s+([\s\S]+)$/i)?.[1] ??
+    "";
+  const quoted = extractQuotedSegments(original);
+  const rawContent = (labeledContent || quoted[quoted.length - 1] || "").trim();
+  const content = rawContent.replace(/^['"`]+|['"`]+$/g, "").trim();
+
+  if (!filePath) {
+    return { shouldHandle: true, missing: "path" };
+  }
+  if (!content) {
+    return { shouldHandle: true, filePath, missing: "content" };
+  }
+  return {
+    shouldHandle: true,
+    filePath,
+    content,
+  };
 }
 
 function truncateInline(input: string, maxChars: number): string {
@@ -1338,8 +1515,8 @@ function formatScheduleTaskLines(
   return tasks.map((task, index) => {
     const due = new Date(task.dueAt);
     const dueLabel = Number.isNaN(due.getTime()) ? task.dueAt : due.toLocaleString("es-AR", { hour12: false });
-    const deliveryLabel = task.deliveryKind ? ` | tipo: ${task.deliveryKind}` : "";
-    return `${index + 1}. ${task.title}\nref: ${task.id}\nvence: ${dueLabel}${deliveryLabel}`;
+    const deliveryLabel = task.deliveryKind === "natural-intent" ? "\nTipo: automatizacion" : "";
+    return `${index + 1}. ${task.title}\nPara: ${dueLabel}${deliveryLabel}`;
   });
 }
 
@@ -2020,26 +2197,198 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
   if (!proxyConfig.telegramBotToken) {
     throw new Error("Falta TELEGRAM_BOT_TOKEN en el entorno.");
   }
-  if (proxyConfig.requireConfirmation) {
-    throw new Error("PROXY_REQUIRE_CONFIRMATION=true no es compatible con Telegram en este modo.");
-  }
 
   const runtime = await createProxyRuntime();
   const { registry, planner, executor, verifier, memory, webApi } = runtime;
   const bot = new Bot(proxyConfig.telegramBotToken);
   const imageClient = new OpenAI({ apiKey: proxyConfig.openAiApiKey });
+  const chatQueue = new ChatMessageQueue();
+  const objectiveState = new ProxyObjectiveStateStore(proxyConfig.objectiveStateDbPath);
+  await objectiveState.init();
+  const agentPolicy = new AgentPolicyEngine(proxyConfig.agentPolicyFile);
+  await agentPolicy.load();
+  const capabilityPolicy = new ProxyCapabilityPolicy({
+    policyEngine: agentPolicy,
+    approvalTtlMs: proxyConfig.approvalTtlMs,
+    requireExecApproval: proxyConfig.requireConfirmation,
+  });
+  const webBrowser = new WebBrowser({
+    timeoutMs: proxyConfig.webFetchTimeoutMs,
+    maxFetchBytes: proxyConfig.webFetchMaxBytes,
+    maxTextChars: proxyConfig.webContentMaxChars,
+    defaultSearchResults: proxyConfig.webSearchMaxResults,
+  });
+  const gmailAccount = createGmailAccountService();
   const activeAgentByChat = new Map<number, string>();
+  const activeObjectiveControllers = new Map<number, ObjectiveRunController>();
   const latestArchivedImageByChat = new Map<number, string>();
+  const latestWebResultsByChat = new Map<number, WebSearchResult[]>();
   const gmailContextByChat = new Map<number, GmailChatContext>();
   const scheduledTasks = new ScheduledTaskSqliteService({
     dbPath: path.join(process.cwd(), "runtime", "proxy-scheduled-tasks.sqlite"),
   });
   await scheduledTasks.load();
+  const intentBiasStore = await IntentBiasStore.create({
+    enabled: proxyConfig.intentBiasEnabled,
+    filePath: proxyConfig.intentBiasFile,
+  });
+  const intentTelemetry = await IntentTelemetry.create({
+    enabled: proxyConfig.intentTelemetryEnabled,
+    filePath: proxyConfig.intentTelemetryFile,
+    sloWindow: proxyConfig.intentSloWindow,
+    sloMaxFailureRate: proxyConfig.intentSloMaxFailureRate,
+    sloMinSamples: proxyConfig.intentSloMinSamples,
+  });
   let scheduleDeliveryLoopRunning = false;
 
   const resolveActiveAgent = (chatId: number): AgentProfile => {
     const activeName = activeAgentByChat.get(chatId) || proxyConfig.defaultAgent;
     return registry.get(activeName) ?? registry.getDefault();
+  };
+
+  const startTypingHeartbeat = (chatId: number, reply?: (text: string) => Promise<unknown>): (() => void) => {
+    let lastPhase: ObjectivePhase | null = null;
+    let heartbeatCount = 0;
+    let lastNoticeAtMs = Date.now();
+    const sendTyping = async (): Promise<void> => {
+      try {
+        await bot.api.sendChatAction(chatId, "typing");
+      } catch {
+        // ignore transient sendChatAction failures
+      }
+    };
+    void sendTyping();
+    const handle = setInterval(() => {
+      void sendTyping();
+      if (!reply || !proxyConfig.agenticStatusEnabled) {
+        return;
+      }
+      const current = objectiveState.getState(chatId);
+      if (!current || current.status !== "active") {
+        return;
+      }
+      if (!["planning", "executing", "verifying"].includes(current.phase)) {
+        lastPhase = current.phase;
+        heartbeatCount = 0;
+        lastNoticeAtMs = Date.now();
+        return;
+      }
+      if (current.phase !== lastPhase) {
+        lastPhase = current.phase;
+        heartbeatCount = 0;
+        lastNoticeAtMs = Date.now();
+        return;
+      }
+      if (Date.now() - lastNoticeAtMs < Math.max(10_000, proxyConfig.progressHeartbeatMs * 2)) {
+        return;
+      }
+      heartbeatCount += 1;
+      const message = pickHeartbeatMessage(current.phase, heartbeatCount);
+      if (!message) {
+        return;
+      }
+      lastNoticeAtMs = Date.now();
+      void reply(message).catch(() => {
+        // ignore transient heartbeat reply failures
+      });
+    }, Math.max(2_000, proxyConfig.progressHeartbeatMs));
+    if (typeof handle.unref === "function") {
+      handle.unref();
+    }
+    return () => clearInterval(handle);
+  };
+
+  const replyLong = async (reply: (text: string) => Promise<unknown>, text: string): Promise<void> => {
+    const chunks = chunkText(text);
+    if (chunks.length === 0) {
+      await reply("No encontre nada util para mostrarte.");
+      return;
+    }
+    for (const chunk of chunks) {
+      await reply(chunk);
+    }
+  };
+
+  const replyProgress = async (params: {
+    chatId: number;
+    reply: (text: string) => Promise<unknown>;
+    phase: ObjectivePhase | "status";
+    text: string;
+  }): Promise<void> => {
+    if (!proxyConfig.agenticStatusEnabled) {
+      try {
+        await bot.api.sendChatAction(params.chatId, "typing");
+      } catch {
+        // ignore
+      }
+      return;
+    }
+    await params.reply(params.text);
+  };
+
+  const enqueueChatWork = async <T>(chatId: number, source: string, fn: () => Promise<T>): Promise<T> => {
+    const queued = await chatQueue.enqueue(chatId, fn);
+    if (queued.waitMs >= 200) {
+      logInfo(`Telegram chat-queue chat=${chatId} source=${source} wait_ms=${queued.waitMs}`);
+    }
+    return queued.result;
+  };
+
+  const buildObjectiveStatusText = (chatId: number): string => {
+    const current = objectiveState.getState(chatId);
+    if (!current) {
+      const semantic = objectiveState.getSemanticState(chatId);
+      if (semantic?.pendingApproval) {
+        return [
+          "No tengo un objetivo activo ahora mismo.",
+          `Confirmación pendiente: ${semantic.pendingApproval.summary}`,
+          'Respondé "sí" para seguir o "no" para cancelarlo.',
+        ].join("\n");
+      }
+      return "No tengo nada reciente para mostrarte en este chat.";
+    }
+    const base = buildFriendlyObjectiveStatusText({
+      current,
+      queueDepth: chatQueue.getDepth(chatId),
+      events: objectiveState.listRecentEvents(chatId, 5),
+    });
+    const semantic = objectiveState.getSemanticState(chatId);
+    if (!semantic?.pendingApproval) {
+      return base;
+    }
+    return [
+      base,
+      "",
+      `Confirmación pendiente: ${semantic.pendingApproval.summary}`,
+      'Respondé "sí" para seguir o "no" para cancelarlo.',
+    ].join("\n");
+  };
+
+  const requestObjectiveCancel = async (params: {
+    chatId: number;
+    reply: (text: string) => Promise<unknown>;
+    reason: string;
+  }): Promise<void> => {
+    const current = objectiveState.getState(params.chatId);
+    if (!current || current.status !== "active") {
+      const pendingApproval = objectiveState.getSemanticState(params.chatId)?.pendingApproval;
+      if (pendingApproval) {
+        objectiveState.clearPendingApproval(params.chatId);
+        await params.reply("Listo, descarte la confirmación pendiente.");
+        return;
+      }
+      await params.reply("No tengo nada activo para frenar ahora.");
+      return;
+    }
+    objectiveState.requestCancel({
+      chatId: params.chatId,
+      reason: params.reason,
+    });
+    const active = activeObjectiveControllers.get(params.chatId);
+    if (active && active.runId === current.runId) {
+      active.controller.abort(new Error(params.reason));
+    }
+    await params.reply(`Listo, ya pedi que se detenga. Estaba en ${humanizeObjectivePhase(current.phase)}.`);
   };
 
   const rememberAssistant = async (params: {
@@ -2076,513 +2425,151 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     });
   };
 
-  const runObjectiveExecution = async (params: {
+  const resolveGmailMessageIdForIntent = async (params: {
     chatId: number;
-    userId?: number;
-    activeAgent: AgentProfile;
-    objectiveRaw: string;
-    reply: (text: string) => Promise<unknown>;
-    plannerAttachmentHint?: string;
-    rememberUserSource?: string;
-  }): Promise<{ status: "success" | "blocked" | "incomplete"; summary: string }> => {
-    const objectiveWithHints = params.plannerAttachmentHint
-      ? `${params.objectiveRaw}\n\n${params.plannerAttachmentHint}`
-      : params.objectiveRaw;
-    let objective = objectiveWithHints;
-    try {
-      const resolved = await resolveWorkspaceHashtagsInText(objectiveWithHints, params.activeAgent);
-      objective = resolved.text;
-      if (resolved.replacements.length > 0) {
-        const mapping = resolved.replacements.map((item) => `${item.tag}->${item.path}`).join(", ");
-        logInfo(`Telegram hashtag-resolve chat=${params.chatId} map="${mapping}"`);
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logError(`No pude resolver hashtags en chat=${params.chatId}: ${message}`);
+    intent: IntentIr;
+  }): Promise<string | undefined> => {
+    const gmail = params.intent.entities.gmail;
+    if (!gmail) {
+      return undefined;
+    }
+    if (gmail.messageId?.trim()) {
+      return gmail.messageId.trim();
     }
 
-    if (memory && params.rememberUserSource) {
-      await rememberUser({
-        chatId: params.chatId,
-        userId: params.userId,
-        text: params.objectiveRaw,
-        source: params.rememberUserSource,
+    const context = getGmailChatContext(gmailContextByChat, params.chatId);
+    if (typeof gmail.messageIndex === "number") {
+      if (gmail.messageIndex === -1) {
+        return context.lastMessageId ?? context.listedMessageIds[0];
+      }
+      const index = Math.max(0, gmail.messageIndex - 1);
+      if (index < context.listedMessageIds.length) {
+        return context.listedMessageIds[index];
+      }
+    }
+
+    if (context.lastMessageId) {
+      return context.lastMessageId;
+    }
+
+    const latest = await gmailAccount.listMessages(gmail.query, 1);
+    if (latest.length === 0 || !latest[0]?.id) {
+      return undefined;
+    }
+    context.listedMessageIds = latest.map((item) => item.id).filter(Boolean);
+    context.lastMessageId = latest[0].id;
+    for (const item of latest) {
+      if (!item.id) {
+        continue;
+      }
+      updateMessageContext(context, item.id, {
+        ...(item.threadId ? { threadId: item.threadId } : {}),
+        ...(item.subject ? { subject: item.subject } : {}),
       });
     }
-
-    const memoryHits = memory
-      ? await memory.recallForObjective({
-          objective,
-          chatId: params.chatId,
-        })
-      : [];
-    const recentConversation = memory
-      ? await memory.getRecentConversation({
-          chatId: params.chatId,
-          limit: proxyConfig.recentConversationTurns,
-        })
-      : [];
-
-    const history: ExecutedCommand[] = [];
-    let guard = { lastSignature: "", repeatedCount: 0 };
-    let lastCommandsSignature = "";
-    let repeatedCommandsCount = 0;
-    let executedCommandsTotal = 0;
-    const forcedDraftSendAttempted = new Set<string>();
-    for (let iteration = 1; iteration <= proxyConfig.maxIterations; iteration += 1) {
-      const gmailContext = getGmailChatContext(gmailContextByChat, params.chatId);
-      const gmailContextBlock = buildGmailPlannerContextBlock(gmailContext);
-      const objectiveForPlanner = gmailContextBlock ? `${objective}\n\n${gmailContextBlock}` : objective;
-      const pendingDraftId = resolvePendingDraftSendFromHistory(objective, history);
-      const shouldForceDraftSend = Boolean(pendingDraftId && !forcedDraftSendAttempted.has(pendingDraftId));
-      const plan: PlannerResponse = shouldForceDraftSend
-        ? {
-            action: "commands",
-            explanation: "Se detectó un draft previo sin envío confirmado. Fuerzo `gmail-api draft send` para completar el objetivo.",
-            commands: [`gmail-api draft send ${pendingDraftId}`],
-          }
-        : await planner.plan({
-            objective: objectiveForPlanner,
-            agent: params.activeAgent,
-            history,
-            iteration,
-            memoryHits,
-            recentConversation,
-            webApi: webApi?.plannerContext ?? null,
-          });
-      if (shouldForceDraftSend && pendingDraftId) {
-        forcedDraftSendAttempted.add(pendingDraftId);
-      }
-      logInfo(
-        `Telegram plan chat=${params.chatId} user=${params.userId ?? 0} iter=${iteration} action=${plan.action} commands=${plan.commands?.length ?? 0}`,
-      );
-
-      if (plan.action === "reply") {
-        const replyText = plan.reply ?? "No tengo una respuesta para eso.";
-        await params.reply(replyText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: replyText,
-          source: "proxy-telegram:reply",
-        });
-        return { status: "incomplete", summary: replyText };
-      }
-
-      if (plan.action === "done") {
-        const doneText = plan.reply ?? "Objetivo completado.";
-        await params.reply(doneText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: doneText,
-          source: "proxy-telegram:done",
-        });
-        return { status: "success", summary: doneText };
-      }
-
-      const commands = plan.commands ?? [];
-      const remaining = Math.max(0, proxyConfig.maxCommandsTotal - executedCommandsTotal);
-      if (remaining <= 0) {
-        const textLimit = `Límite alcanzado: ${proxyConfig.maxCommandsTotal} comandos ejecutados para este objetivo.`;
-        await params.reply(textLimit);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: textLimit,
-          source: "proxy-telegram:limit",
-        });
-        return { status: "incomplete", summary: textLimit };
-      }
-      const commandsToRun = commands.slice(0, remaining);
-      const rewrittenCommandsToRun = commandsToRun.map((item) => rewriteGmailCommandWithContext(item, gmailContext));
-      const rewriteChanged = rewrittenCommandsToRun.some((item, index) => item !== commandsToRun[index]);
-      if (rewriteChanged) {
-        logInfo(`Telegram gmail-context-rewrite chat=${params.chatId} iter=${iteration}`);
-      }
-      const planLines = [
-        `Plan (${iteration}/${proxyConfig.maxIterations}):`,
-        plan.explanation ?? "",
-        "",
-        "Comandos:",
-        ...rewrittenCommandsToRun.map((command, index) => `${index + 1}. ${command}`),
-      ];
-      if (commandsToRun.length < commands.length) {
-        planLines.push("");
-        planLines.push(
-          `Aviso: truncado por límite total, ejecutando ${commandsToRun.length} de ${commands.length} comandos.`,
-        );
-      }
-      await params.reply(planLines.join("\n"));
-
-      const results = await executor.runSequence(params.activeAgent, rewrittenCommandsToRun);
-      executedCommandsTotal += results.length;
-      history.push(...results);
-      for (const result of results) {
-        logInfo(
-          `Telegram exec chat=${params.chatId} iter=${iteration} command="${result.command}" exit=${result.exitCode ?? "null"} timeout=${String(result.timedOut)}`,
-        );
-        updateGmailContextFromExecution(gmailContext, result);
-      }
-
-      for (const result of results) {
-        const presentable = await presentListingResultForWorkspace(result, params.activeAgent);
-        const textOutput = formatExecution(presentable);
-        const chunks = chunkText(textOutput);
-        if (chunks.length === 0) {
-          await params.reply("$ (sin salida)");
-          continue;
-        }
-        for (const chunk of chunks) {
-          await params.reply(chunk);
-        }
-      }
-
-      const verification = await verifier.verify({
-        objective,
-        agent: params.activeAgent,
-        iteration,
-        latestCommands: rewrittenCommandsToRun,
-        latestResults: results,
-        history,
-      });
-      logInfo(
-        `Telegram verify chat=${params.chatId} user=${params.userId ?? 0} iter=${iteration} status=${verification.status} summary="${verification.summary.slice(0, 160)}"`,
-      );
-      if (verification.status === "success") {
-        await params.reply(verification.summary);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: verification.summary,
-          source: "proxy-telegram:verify-success",
-        });
-        return { status: "success", summary: verification.summary };
-      }
-      if (verification.status === "blocked") {
-        await params.reply(verification.summary);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: verification.summary,
-          source: "proxy-telegram:verify-blocked",
-        });
-        return { status: "blocked", summary: verification.summary };
-      }
-
-      const commandsSignature = JSON.stringify(rewrittenCommandsToRun.map((item) => item.trim()));
-      if (commandsSignature === lastCommandsSignature) {
-        repeatedCommandsCount += 1;
-      } else {
-        repeatedCommandsCount = 0;
-      }
-      lastCommandsSignature = commandsSignature;
-
-      const allSucceeded =
-        results.length > 0 &&
-        results.every((item) => Number.isFinite(item.exitCode ?? Number.NaN) && item.exitCode === 0 && !item.timedOut);
-      if (verification.status === "continue" && allSucceeded && repeatedCommandsCount >= 1) {
-        const repeatedCmdText =
-          "Detuve la ejecución porque se repitió el mismo comando con éxito sin avanzar el objetivo. Indícame el siguiente paso o reformula el pedido.";
-        logInfo(
-          `Telegram repeat-command-guard chat=${params.chatId} user=${params.userId ?? 0} iter=${iteration} repeated=${repeatedCommandsCount + 1}`,
-        );
-        await params.reply(repeatedCmdText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: repeatedCmdText,
-          source: "proxy-telegram:repeat-command-guard",
-        });
-        return { status: "incomplete", summary: repeatedCmdText };
-      }
-
-      const guardResult = nextLoopGuardState(guard, rewrittenCommandsToRun, results);
-      guard = guardResult.state;
-      if (guardResult.shouldStop) {
-        const loopText =
-          "Detuve la ejecución porque la secuencia y el resultado se repitieron. El objetivo parece resuelto o estancado.";
-        await params.reply(loopText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: loopText,
-          source: "proxy-telegram:loop-guard",
-        });
-        return { status: "incomplete", summary: loopText };
-      }
-    }
-
-    const maxIterText = `No se completó el objetivo en ${proxyConfig.maxIterations} iteraciones. Reformula o amplía el pedido.`;
-    await params.reply(maxIterText);
-    await rememberAssistant({
-      chatId: params.chatId,
-      userId: params.userId,
-      text: maxIterText,
-      source: "proxy-telegram:max-iterations",
-    });
-    return { status: "incomplete", summary: maxIterText };
+    return latest[0].id;
   };
 
-  const maybeHandleNaturalScheduleInstruction = async (params: {
-    chatId: number;
-    userId?: number;
-    text: string;
-    reply: (text: string) => Promise<unknown>;
-  }): Promise<boolean> => {
-    const intent = detectScheduleNaturalIntent(params.text);
-    if (!intent.shouldHandle || !intent.action) {
-      return false;
-    }
-    logInfo(
-      `Telegram schedule-intent chat=${params.chatId} user=${params.userId ?? 0} action=${intent.action} due=${intent.dueAt?.toISOString() ?? "-"} hasAutomation=${String(Boolean(intent.automationInstruction))} domain=${intent.automationDomain ?? "-"}`,
-    );
+  const handleDeterministicIntent = createDeterministicIntentHandler({
+    objectiveState,
+    replyLong,
+    replyProgress,
+    rememberAssistant,
+    gmailAccount,
+    getGmailContext: (chatId) => getGmailChatContext(gmailContextByChat, chatId),
+    updateGmailMessageContext: updateMessageContext,
+    resolveGmailMessageIdForIntent,
+    buildScheduledGmailSendPayload,
+    createWorkspaceFilesService,
+    createDocumentReader,
+    expandWorkspacePathForDirectUse,
+    formatBytes,
+    getLatestWebResults: (chatId) => latestWebResultsByChat.get(chatId) ?? [],
+    setLatestWebResults: (chatId, hits) => {
+      latestWebResultsByChat.set(chatId, hits);
+    },
+    webBrowser,
+    listMaxResults: proxyConfig.webSearchMaxResults,
+    webSearchMaxResults: proxyConfig.webSearchMaxResults,
+    buildWebResultsListText,
+  });
 
-    try {
-      await rememberUser({
-        chatId: params.chatId,
-        userId: params.userId,
-        text: params.text,
-        source: "proxy-telegram:schedule-user",
-      });
+  const maybeHandleNaturalScheduleInstruction = createNaturalScheduleHandler({
+    intentBiasStore,
+    intentRoutingThreshold: proxyConfig.intentRoutingThreshold,
+    logInfo,
+    rememberUser,
+    rememberAssistant,
+    scheduledTasks,
+    formatScheduleTaskLines,
+    buildScheduledNaturalIntentPayload,
+    formatScheduleDateTime,
+  });
 
-      if (intent.action === "list") {
-        const pending = scheduledTasks.listPending(params.chatId);
-        const responseText =
-          pending.length === 0
-            ? "No hay tareas programadas pendientes."
-            : [`Tareas pendientes (${pending.length}):`, ...formatScheduleTaskLines(pending)].join("\n\n");
-        await params.reply(responseText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: responseText,
-          source: "proxy-telegram:schedule-list",
-        });
-        return true;
+  const actionRegistry = createProxyActionRegistry({
+    objectiveState,
+    handleDeterministicIntent,
+    maybeHandleNaturalScheduleInstruction,
+    updateSemanticReferences,
+  });
+
+  const runObjectiveExecution = createObjectiveExecutionRunner({
+    config: {
+      intentShadowEnabled: proxyConfig.intentShadowEnabled,
+      deterministicRoutingThreshold: proxyConfig.deterministicRoutingThreshold,
+      objectiveMaxMs: proxyConfig.objectiveMaxMs,
+      intentAbstainThreshold: proxyConfig.intentAbstainThreshold,
+      recentConversationTurns: proxyConfig.recentConversationTurns,
+      maxIterations: proxyConfig.maxIterations,
+      plannerTimeoutMs: proxyConfig.plannerTimeoutMs,
+      intentCriticEnabled: proxyConfig.intentCriticEnabled,
+      maxCommandsTotal: proxyConfig.maxCommandsTotal,
+      verifierTimeoutMs: proxyConfig.verifierTimeoutMs,
+    },
+    objectiveState,
+    intentBiasStore,
+    intentTelemetry,
+    planner,
+    executor,
+    verifier,
+    memory,
+    webApi,
+    policyGate: capabilityPolicy,
+    actionRegistry,
+    startTypingHeartbeat,
+    replyProgress,
+    rememberAssistant,
+    rememberUser,
+    registerActiveObjectiveController: (chatId, controller) => {
+      activeObjectiveControllers.set(chatId, controller);
+    },
+    clearActiveObjectiveController: (chatId, runId) => {
+      const current = activeObjectiveControllers.get(chatId);
+      if (current?.runId === runId) {
+        activeObjectiveControllers.delete(chatId);
       }
-
-      if (intent.action === "create") {
-        if (!intent.dueAt || !Number.isFinite(intent.dueAt.getTime())) {
-          const text =
-            "No pude inferir fecha/hora. Ejemplos: 'recordame mañana a las 10 pagar expensas' o 'en 2 horas llamo a Juan'.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-        if (intent.dueAt.getTime() <= Date.now() + 10_000) {
-          const text =
-            "La fecha/hora quedó en pasado o demasiado cerca. Indícame una hora futura (ej: en 10 minutos).";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-        const title = intent.taskTitle?.trim() ?? "";
-        if (!title) {
-          const text = "No pude inferir la tarea. Ejemplo: 'recordame mañana a las 10 pagar expensas'.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-
-        const hasAutomationInstruction = Boolean(intent.automationInstruction?.trim());
-        const automationPayload = hasAutomationInstruction
-          ? buildScheduledNaturalIntentPayload({
-              rawText: params.text,
-              instruction: intent.automationInstruction?.trim() ?? "",
-              taskTitle: title,
-              automationDomain: intent.automationDomain,
-              recurrenceDaily: intent.automationRecurrenceDaily,
-            })
-          : null;
-        if (hasAutomationInstruction && !automationPayload?.payload) {
-          const text =
-            automationPayload?.errorText ??
-            "No pude estructurar la automatización. Reescribe con destinatario y mensaje explícitos.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-
-        const created = await scheduledTasks.createTask({
-          chatId: params.chatId,
-          ...(typeof params.userId === "number" ? { userId: params.userId } : {}),
-          title,
-          dueAt: intent.dueAt,
-          ...(hasAutomationInstruction ? { deliveryKind: "natural-intent" as const } : {}),
-          ...(hasAutomationInstruction
-            ? {
-                deliveryPayload: JSON.stringify(automationPayload?.payload),
-              }
-            : {}),
-        });
-        const pending = scheduledTasks.listPending(params.chatId);
-        const index = Math.max(1, pending.findIndex((item) => item.id === created.id) + 1);
-        const responseText = [
-          hasAutomationInstruction ? "Automatización programada." : "Tarea programada.",
-          `#${index} | id: ${created.id}`,
-          `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
-          `detalle: ${created.title}`,
-          ...(hasAutomationInstruction ? [`accion: ${intent.automationInstruction?.trim()}`] : []),
-          ...(automationPayload?.responseHints ?? []),
-          ...(intent.automationRecurrenceDaily ? ["recurrencia: diaria"] : []),
-        ].join("\n");
-        await params.reply(responseText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: responseText,
-          source: "proxy-telegram:schedule-create",
-        });
-        return true;
-      }
-
-      if (intent.action === "delete") {
-        const ref = intent.taskRef?.trim() ?? "";
-        if (!ref) {
-          const text = "Indica qué tarea eliminar. Ejemplos: 'elimina tarea 2' o 'borra la última tarea'.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-        const target = scheduledTasks.resolveTaskByRef(params.chatId, ref);
-        if (!target) {
-          const text = "No encontré esa tarea pendiente. Usa 'lista mis tareas' para ver índices.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-        const canceled = await scheduledTasks.cancelTask(target.id);
-        const responseText = [`Tarea eliminada.`, `id: ${canceled.id}`, `detalle: ${canceled.title}`].join("\n");
-        await params.reply(responseText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: responseText,
-          source: "proxy-telegram:schedule-delete",
-        });
-        return true;
-      }
-
-      if (intent.action === "edit") {
-        const ref = intent.taskRef?.trim() ?? "";
-        if (!ref) {
-          const text = "Indica qué tarea editar. Ejemplo: 'edita tarea 2 para mañana 18:30'.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-        const target = scheduledTasks.resolveTaskByRef(params.chatId, ref);
-        if (!target) {
-          const text = "No encontré esa tarea pendiente. Usa 'lista mis tareas' para ver índices.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-
-        const changes: { title?: string; dueAt?: Date } = {};
-        if (intent.taskTitle?.trim()) {
-          changes.title = intent.taskTitle.trim();
-        }
-        if (intent.dueAt && Number.isFinite(intent.dueAt.getTime())) {
-          if (intent.dueAt.getTime() <= Date.now() + 10_000) {
-            const text = "La nueva fecha/hora debe ser futura.";
-            await params.reply(text);
-            await rememberAssistant({
-              chatId: params.chatId,
-              userId: params.userId,
-              text,
-              source: "proxy-telegram:schedule-error",
-            });
-            return true;
-          }
-          changes.dueAt = intent.dueAt;
-        }
-
-        if (!changes.title && !changes.dueAt) {
-          const text =
-            "No detecté cambios. Ejemplos: 'edita tarea 2 para mañana 18' o 'edita tarea 2 texto: llamar a Juan'.";
-          await params.reply(text);
-          await rememberAssistant({
-            chatId: params.chatId,
-            userId: params.userId,
-            text,
-            source: "proxy-telegram:schedule-error",
-          });
-          return true;
-        }
-
-        const updated = await scheduledTasks.updateTask(target.id, changes);
-        const responseText = [
-          "Tarea actualizada.",
-          `id: ${updated.id}`,
-          `cuando: ${formatScheduleDateTime(new Date(updated.dueAt))}`,
-          `detalle: ${updated.title}`,
-        ].join("\n");
-        await params.reply(responseText);
-        await rememberAssistant({
-          chatId: params.chatId,
-          userId: params.userId,
-          text: responseText,
-          source: "proxy-telegram:schedule-edit",
-        });
-        return true;
-      }
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const responseText = `No pude gestionar la tarea programada: ${message}`;
-      await params.reply(responseText);
-      await rememberAssistant({
-        chatId: params.chatId,
-        userId: params.userId,
-        text: responseText,
-        source: "proxy-telegram:schedule-error",
-      });
-      return true;
-    }
-
-    return false;
-  };
+    },
+    getGmailPlannerContextBlock: (chatId) => buildGmailPlannerContextBlock(getGmailChatContext(gmailContextByChat, chatId)),
+    resolvePendingDraftSendFromHistory,
+    rewritePlannerCommands: (chatId, commands) => {
+      const gmailContext = getGmailChatContext(gmailContextByChat, chatId);
+      const rewritten = commands.map((item) => rewriteGmailCommandWithContext(item, gmailContext));
+      return {
+        commands: rewritten,
+        changed: rewritten.some((item, index) => item !== commands[index]),
+      };
+    },
+    updateChatExecutionContext: (chatId, result) => {
+      updateGmailContextFromExecution(getGmailChatContext(gmailContextByChat, chatId), result);
+    },
+    presentExecutionResultChunks: async (result, activeAgent) => {
+      const presentable = await presentListingResultForWorkspace(result, activeAgent);
+      return chunkText(buildExecutionReplyText(presentable) ?? "");
+    },
+    logInfo,
+    logWarn,
+    logError,
+  });
 
   const handleTaskCommand = async (params: {
     chatId: number;
@@ -2602,10 +2589,10 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     const listPendingTasks = async (): Promise<void> => {
       const pending = scheduledTasks.listPending(params.chatId);
       if (pending.length === 0) {
-        await params.reply("No hay tareas programadas pendientes.");
+        await params.reply("No tenes tareas pendientes.");
         return;
       }
-      await params.reply([`Tareas pendientes (${pending.length}):`, ...formatScheduleTaskLines(pending)].join("\n\n"));
+      await params.reply([`Tenes ${pending.length} tarea(s) pendiente(s):`, ...formatScheduleTaskLines(pending)].join("\n\n"));
     };
 
     const input = params.input.trim();
@@ -2676,13 +2663,12 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
       });
       await params.reply(
         [
-          hasAutomationInstruction ? "Automatización programada." : "Tarea programada.",
-          `id: ${created.id}`,
-          `cuando: ${formatScheduleDateTime(new Date(created.dueAt))}`,
-          `detalle: ${created.title}`,
-          ...(hasAutomationInstruction ? [`accion: ${automation.instruction}`] : []),
+          hasAutomationInstruction ? "Listo, deje la automatizacion programada." : "Listo, deje la tarea agendada.",
+          `Para: ${formatScheduleDateTime(new Date(created.dueAt))}`,
+          `Detalle: ${created.title}`,
+          ...(hasAutomationInstruction ? [`Se va a ejecutar: ${automation.instruction}`] : []),
           ...(automationPayload?.responseHints ?? []),
-          ...(automation.recurrenceDaily ? ["recurrencia: diaria"] : []),
+          ...(automation.recurrenceDaily ? ["Se repite todos los dias."] : []),
         ].join("\n"),
       );
       return;
@@ -2700,7 +2686,7 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
         return;
       }
       const canceled = await scheduledTasks.cancelTask(task.id);
-      await params.reply([`Tarea eliminada.`, `id: ${canceled.id}`, `detalle: ${canceled.title}`].join("\n"));
+      await params.reply([`Listo, elimine esta tarea:`, canceled.title].join("\n"));
       return;
     }
 
@@ -2766,10 +2752,9 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
       const updated = await scheduledTasks.updateTask(target.id, changes);
       await params.reply(
         [
-          "Tarea actualizada.",
-          `id: ${updated.id}`,
-          `cuando: ${formatScheduleDateTime(new Date(updated.dueAt))}`,
-          `detalle: ${updated.title}`,
+          "Listo, actualice la tarea.",
+          `Para: ${formatScheduleDateTime(new Date(updated.dueAt))}`,
+          `Detalle: ${updated.title}`,
         ].join("\n"),
       );
       return;
@@ -2786,121 +2771,116 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     try {
       const due = scheduledTasks.dueTasks(new Date());
       for (const task of due) {
-        try {
-          if (task.deliveryKind === "natural-intent") {
-            const payload = parseScheduledNaturalIntentPayload(task.deliveryPayload);
-            const instruction = payload?.instruction?.trim();
-            if (!instruction) {
-              throw new Error("No hay instrucción para la automatización programada.");
+        await enqueueChatWork(task.chatId, `scheduled-task:${task.id}`, async () => {
+          try {
+            if (task.deliveryKind === "natural-intent") {
+              const payload = parseScheduledNaturalIntentPayload(task.deliveryPayload);
+              const instruction = payload?.instruction?.trim();
+              if (!instruction) {
+                throw new Error("No hay instrucción para la automatización programada.");
+              }
+              const payloadSafe = payload;
+
+              if (payloadSafe?.gmailSend) {
+                const command = buildGmailSendCommandFromPayload(payloadSafe.gmailSend);
+                const activeAgent = resolveActiveAgent(task.chatId);
+                await bot.api.sendMessage(
+                  task.chatId,
+                  `Arranco la automatizacion programada para enviar un email a ${payloadSafe.gmailSend.to}.`,
+                );
+                logInfo(`Telegram schedule gmail-send start chat=${task.chatId} task=${task.id} command="${command}"`);
+                const results = await executor.runSequence(activeAgent, [command]);
+                const sendResult = results[0];
+                if (!sendResult) {
+                  throw new Error("No hubo resultado al ejecutar gmail-api send.");
+                }
+                const evidence = parseGmailSendExecutionEvidence(sendResult);
+                if (!evidence.sent) {
+                  throw new Error(
+                    `No se confirmó envío real del email. ${evidence.reason ?? "Sin evidencia sent=true."}`.trim(),
+                  );
+                }
+                logInfo(
+                  `Telegram schedule gmail-send ok chat=${task.chatId} task=${task.id} message=${evidence.messageId ?? "-"} thread=${evidence.threadId ?? "-"}`,
+                );
+                await bot.api.sendMessage(
+                  task.chatId,
+                  buildFriendlyGmailSendText({
+                    to: payloadSafe.gmailSend.to,
+                    subject: payloadSafe.gmailSend.subject,
+                  }),
+                );
+              } else {
+                await bot.api.sendMessage(
+                  task.chatId,
+                  `Arranco la automatizacion programada: ${instruction}`,
+                );
+
+                const runOutcome = await runObjectiveExecution({
+                  chatId: task.chatId,
+                  ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
+                  activeAgent: resolveActiveAgent(task.chatId),
+                  objectiveRaw: instruction,
+                  reply: async (text: string) => bot.api.sendMessage(task.chatId, text),
+                  rememberUserSource: undefined,
+                });
+                logInfo(
+                  `Telegram schedule objective outcome chat=${task.chatId} task=${task.id} status=${runOutcome.status} summary="${runOutcome.summary.slice(0, 160)}"`,
+                );
+                if (runOutcome.status !== "success") {
+                  throw new Error(`No se confirmó ejecución exitosa: ${runOutcome.summary}`);
+                }
+              }
+
+              if (payloadSafe?.recurrence?.frequency === "daily") {
+                const nextDueAt = buildNextDailyOccurrence(task.dueAt, new Date());
+                const createdNext = await scheduledTasks.createTask({
+                  chatId: task.chatId,
+                  ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
+                  title: task.title,
+                  dueAt: nextDueAt,
+                  deliveryKind: "natural-intent",
+                  deliveryPayload: task.deliveryPayload,
+                });
+                await bot.api.sendMessage(
+                  task.chatId,
+                  [
+                    "Listo, la automatizacion diaria quedo reprogramada.",
+                    `Proxima ejecucion: ${formatScheduleDateTime(new Date(createdNext.dueAt))}`,
+                  ].join("\n"),
+                );
+              }
+
+              await scheduledTasks.markDelivered(task.id, new Date());
+              logInfo(`Telegram schedule delivered chat=${task.chatId} task=${task.id} kind=natural-intent`);
+              return;
             }
-            const payloadSafe = payload;
 
-            if (payloadSafe?.gmailSend) {
-              const command = buildGmailSendCommandFromPayload(payloadSafe.gmailSend);
-              const activeAgent = resolveActiveAgent(task.chatId);
-              await bot.api.sendMessage(
-                task.chatId,
-                [
-                  "Automatización Gmail programada en curso.",
-                  `id: ${task.id}`,
-                  `to: ${payloadSafe.gmailSend.to}`,
-                  `subject: ${payloadSafe.gmailSend.subject}`,
-                ].join("\n"),
-              );
-              logInfo(`Telegram schedule gmail-send start chat=${task.chatId} task=${task.id} command="${command}"`);
-              const results = await executor.runSequence(activeAgent, [command]);
-              const sendResult = results[0];
-              if (!sendResult) {
-                throw new Error("No hubo resultado al ejecutar gmail-api send.");
-              }
-              const evidence = parseGmailSendExecutionEvidence(sendResult);
-              const textOutput = formatExecution(sendResult);
-              for (const chunk of chunkText(textOutput)) {
-                await bot.api.sendMessage(task.chatId, chunk);
-              }
-              if (!evidence.sent) {
-                throw new Error(`No se confirmó envío real del email. ${evidence.reason ?? "Sin evidencia sent=true."}`.trim());
-              }
-              logInfo(
-                `Telegram schedule gmail-send ok chat=${task.chatId} task=${task.id} message=${evidence.messageId ?? "-"} thread=${evidence.threadId ?? "-"}`,
-              );
-              await bot.api.sendMessage(
-                task.chatId,
-                `Email enviado por tarea programada.\nmessage_id: ${evidence.messageId}\nthread_id: ${evidence.threadId ?? "-"}`,
-              );
-            } else {
-              await bot.api.sendMessage(
-                task.chatId,
-                ["Automatización programada en curso.", `id: ${task.id}`, `accion: ${instruction}`].join("\n"),
-              );
-
-              const runOutcome = await runObjectiveExecution({
-                chatId: task.chatId,
-                ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
-                activeAgent: resolveActiveAgent(task.chatId),
-                objectiveRaw: instruction,
-                reply: async (text: string) => bot.api.sendMessage(task.chatId, text),
-                rememberUserSource: undefined,
-              });
-              logInfo(
-                `Telegram schedule objective outcome chat=${task.chatId} task=${task.id} status=${runOutcome.status} summary="${runOutcome.summary.slice(0, 160)}"`,
-              );
-              if (runOutcome.status !== "success") {
-                throw new Error(`No se confirmó ejecución exitosa: ${runOutcome.summary}`);
-              }
-            }
-
-            if (payloadSafe?.recurrence?.frequency === "daily") {
-              const nextDueAt = buildNextDailyOccurrence(task.dueAt, new Date());
-              const createdNext = await scheduledTasks.createTask({
-                chatId: task.chatId,
-                ...(typeof task.userId === "number" ? { userId: task.userId } : {}),
-                title: task.title,
-                dueAt: nextDueAt,
-                deliveryKind: "natural-intent",
-                deliveryPayload: task.deliveryPayload,
-              });
-              await bot.api.sendMessage(
-                task.chatId,
-                [
-                  "Automatización diaria reprogramada.",
-                  `id anterior: ${task.id}`,
-                  `nuevo id: ${createdNext.id}`,
-                  `proxima ejecucion: ${formatScheduleDateTime(new Date(createdNext.dueAt))}`,
-                ].join("\n"),
-              );
-            }
-
+            await bot.api.sendMessage(
+              task.chatId,
+              [
+                "Recordatorio:",
+                task.title,
+                `Era para: ${formatScheduleDateTime(new Date(task.dueAt))}`,
+              ].join("\n"),
+            );
             await scheduledTasks.markDelivered(task.id, new Date());
-            logInfo(`Telegram schedule delivered chat=${task.chatId} task=${task.id} kind=natural-intent`);
-            continue;
+            logInfo(`Telegram schedule delivered chat=${task.chatId} task=${task.id} kind=reminder`);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            try {
+              await scheduledTasks.markDeliveryFailure(task.id, message, new Date());
+            } catch {
+              // ignore secondary failures
+            }
+            logError(`Telegram schedule delivery error chat=${task.chatId} task=${task.id}: ${message}`);
+            try {
+              await bot.api.sendMessage(task.chatId, `Una tarea programada fallo: ${message}`);
+            } catch {
+              // ignore send failure
+            }
           }
-
-          await bot.api.sendMessage(
-            task.chatId,
-            [
-              "Recordatorio programado",
-              `id: ${task.id}`,
-              `cuando: ${formatScheduleDateTime(new Date(task.dueAt))}`,
-              `detalle: ${task.title}`,
-            ].join("\n"),
-          );
-          await scheduledTasks.markDelivered(task.id, new Date());
-          logInfo(`Telegram schedule delivered chat=${task.chatId} task=${task.id} kind=reminder`);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          try {
-            await scheduledTasks.markDeliveryFailure(task.id, message, new Date());
-          } catch {
-            // ignore secondary failures
-          }
-          logError(`Telegram schedule delivery error chat=${task.chatId} task=${task.id}: ${message}`);
-          try {
-            await bot.api.sendMessage(task.chatId, `Falló una tarea programada (${task.id}): ${message}`);
-          } catch {
-            // ignore send failure
-          }
-        }
+        });
       }
     } finally {
       scheduleDeliveryLoopRunning = false;
@@ -2922,6 +2902,28 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
   }
   void processDueScheduledTasks();
 
+  const objectiveWatchdogHandle = setInterval(() => {
+    const stale = objectiveState.listStaleActiveStates(proxyConfig.objectiveMaxMs);
+    for (const state of stale) {
+      const active = activeObjectiveControllers.get(state.chatId);
+      if (active && active.runId === state.runId) {
+        active.controller.abort(new Error(`timeout ${proxyConfig.objectiveMaxMs}ms`));
+        continue;
+      }
+      objectiveState.finishRun({
+        chatId: state.chatId,
+        runId: state.runId,
+        status: "cancelled",
+        phase: "cancelled",
+        summary: "Objetivo cancelado por estado obsoleto.",
+        reason: "stale_objective_state",
+      });
+    }
+  }, Math.max(5_000, proxyConfig.progressHeartbeatMs));
+  if (typeof objectiveWatchdogHandle.unref === "function") {
+    objectiveWatchdogHandle.unref();
+  }
+
   bot.on("message:photo", async (ctx) => {
     const userId = ctx.from?.id;
     if (!userId || !isAllowedUser(userId)) {
@@ -2929,92 +2931,94 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     }
 
     const chatId = ctx.chat.id;
-    const activeAgent = resolveActiveAgent(chatId);
-    const caption = (ctx.message.caption ?? "").trim();
-    const photo = ctx.message.photo[ctx.message.photo.length - 1];
+    await enqueueChatWork(chatId, "message:photo", async () => {
+      const activeAgent = resolveActiveAgent(chatId);
+      const caption = (ctx.message.caption ?? "").trim();
+      const photo = ctx.message.photo[ctx.message.photo.length - 1];
 
-    if (!photo?.file_id) {
-      await ctx.reply("No pude leer la imagen recibida.");
-      return;
-    }
-
-    await rememberUser({
-      chatId,
-      userId,
-      text: caption ? `[imagen] ${caption}` : "[imagen sin texto]",
-      source: "proxy-telegram:image-user",
-    });
-
-    try {
-      const telegramFile = await ctx.api.getFile(photo.file_id);
-      const telegramFilePath = telegramFile.file_path;
-      if (!telegramFilePath) {
-        throw new Error("Telegram no devolvio file_path para la imagen.");
+      if (!photo?.file_id) {
+        await ctx.reply("No pude leer la imagen recibida.");
+        return;
       }
 
-      const bytes = await downloadTelegramFileBuffer({
-        botToken: proxyConfig.telegramBotToken,
-        filePath: telegramFilePath,
-        maxBytes: proxyConfig.imageMaxFileBytes,
-      });
-
-      const archived = await archiveImageInWorkspace({
-        agent: activeAgent,
+      await rememberUser({
         chatId,
-        messageId: ctx.message.message_id,
-        bytes,
-        mimeType: "image/jpeg",
-        originalName: undefined,
-        telegramFilePath,
+        userId,
+        text: caption ? `[imagen] ${caption}` : "[imagen sin texto]",
+        source: "proxy-telegram:image-user",
       });
-      latestArchivedImageByChat.set(chatId, archived.relativePath);
 
-      let analysis = "";
       try {
-        analysis = await analyzeImageWithOpenAi({
-          client: imageClient,
-          bytes,
-          mimeType: archived.mimeType,
-          caption,
+        const telegramFile = await ctx.api.getFile(photo.file_id);
+        const telegramFilePath = telegramFile.file_path;
+        if (!telegramFilePath) {
+          throw new Error("Telegram no devolvio file_path para la imagen.");
+        }
+
+        const bytes = await downloadTelegramFileBuffer({
+          botToken: proxyConfig.telegramBotToken,
+          filePath: telegramFilePath,
+          maxBytes: proxyConfig.imageMaxFileBytes,
         });
+
+        const archived = await archiveImageInWorkspace({
+          agent: activeAgent,
+          chatId,
+          messageId: ctx.message.message_id,
+          bytes,
+          mimeType: "image/jpeg",
+          originalName: undefined,
+          telegramFilePath,
+        });
+        latestArchivedImageByChat.set(chatId, archived.relativePath);
+
+        let analysis = "";
+        try {
+          analysis = await analyzeImageWithOpenAi({
+            client: imageClient,
+            bytes,
+            mimeType: archived.mimeType,
+            caption,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          analysis = `No pude analizar la imagen con el modelo. Detalle: ${message}`;
+        }
+
+        const replyText = [
+          "Listo, ya procese la imagen.",
+          `La guarde como ${archived.relativePath}.`,
+          `Pesa ${formatBytes(archived.bytes)}.`,
+          "",
+          "Esto vi:",
+          analysis,
+          "",
+          `Si despues queres reenviarla como adjunto: /adjuntar #${toHashtagToken(archived.relativePath)}`,
+        ].join("\n");
+
+        await ctx.reply(replyText);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: replyText,
+          source: "proxy-telegram:image-analysis",
+        });
+        logInfo(
+          `Telegram image chat=${chatId} user=${userId} archived=${archived.relativePath} bytes=${archived.bytes}`,
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        analysis = `No pude analizar la imagen con el modelo. Detalle: ${message}`;
+        const replyText = `No pude procesar la imagen: ${message}`;
+        await ctx.reply(replyText);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: replyText,
+          source: "proxy-telegram:image-error",
+        });
+        logError(`Telegram image error chat=${chatId} user=${userId}: ${message}`);
       }
-
-      const replyText = [
-        "Imagen procesada.",
-        `Archivo: ${fileReference(archived.relativePath)}`,
-        `Tamano: ${archived.bytes} bytes`,
-        "",
-        "Analisis:",
-        analysis,
-        "",
-        `Para reenviarla como adjunto: /adjuntar #${toHashtagToken(archived.relativePath)}`,
-      ].join("\n");
-
-      await ctx.reply(replyText);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: replyText,
-        source: "proxy-telegram:image-analysis",
-      });
-      logInfo(
-        `Telegram image chat=${chatId} user=${userId} archived=${archived.relativePath} bytes=${archived.bytes}`,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const replyText = `No pude procesar la imagen: ${message}`;
-      await ctx.reply(replyText);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: replyText,
-        source: "proxy-telegram:image-error",
-      });
-      logError(`Telegram image error chat=${chatId} user=${userId}: ${message}`);
-    }
+    });
   });
 
   bot.on("message:document", async (ctx) => {
@@ -3024,96 +3028,98 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     }
 
     const chatId = ctx.chat.id;
-    const activeAgent = resolveActiveAgent(chatId);
-    const document = ctx.message.document;
-    const mimeType = (document.mime_type ?? "").toLowerCase();
-    const fileName = document.file_name ?? "";
+    await enqueueChatWork(chatId, "message:document", async () => {
+      const activeAgent = resolveActiveAgent(chatId);
+      const document = ctx.message.document;
+      const mimeType = (document.mime_type ?? "").toLowerCase();
+      const fileName = document.file_name ?? "";
 
-    const isImageDocument = mimeType.startsWith("image/") || isImagePath(fileName);
-    if (!isImageDocument) {
-      await ctx.reply("Recibi un documento, pero solo proceso imagenes en este flujo.");
-      return;
-    }
-
-    const caption = (ctx.message.caption ?? "").trim();
-    await rememberUser({
-      chatId,
-      userId,
-      text: caption ? `[imagen-documento] ${caption}` : `[imagen-documento] ${fileName || "sin nombre"}`,
-      source: "proxy-telegram:image-user",
-    });
-
-    try {
-      const telegramFile = await ctx.api.getFile(document.file_id);
-      const telegramFilePath = telegramFile.file_path;
-      if (!telegramFilePath) {
-        throw new Error("Telegram no devolvio file_path para el documento.");
+      const isImageDocument = mimeType.startsWith("image/") || isImagePath(fileName);
+      if (!isImageDocument) {
+        await ctx.reply("Recibi un documento, pero en este flujo solo analizo imagenes.");
+        return;
       }
 
-      const bytes = await downloadTelegramFileBuffer({
-        botToken: proxyConfig.telegramBotToken,
-        filePath: telegramFilePath,
-        maxBytes: proxyConfig.imageMaxFileBytes,
-      });
-
-      const normalizedMime = mimeType.startsWith("image/") ? mimeType : "image/jpeg";
-      const archived = await archiveImageInWorkspace({
-        agent: activeAgent,
+      const caption = (ctx.message.caption ?? "").trim();
+      await rememberUser({
         chatId,
-        messageId: ctx.message.message_id,
-        bytes,
-        mimeType: normalizedMime,
-        originalName: fileName || undefined,
-        telegramFilePath,
+        userId,
+        text: caption ? `[imagen-documento] ${caption}` : `[imagen-documento] ${fileName || "sin nombre"}`,
+        source: "proxy-telegram:image-user",
       });
-      latestArchivedImageByChat.set(chatId, archived.relativePath);
 
-      let analysis = "";
       try {
-        analysis = await analyzeImageWithOpenAi({
-          client: imageClient,
-          bytes,
-          mimeType: archived.mimeType,
-          caption,
+        const telegramFile = await ctx.api.getFile(document.file_id);
+        const telegramFilePath = telegramFile.file_path;
+        if (!telegramFilePath) {
+          throw new Error("Telegram no devolvio file_path para el documento.");
+        }
+
+        const bytes = await downloadTelegramFileBuffer({
+          botToken: proxyConfig.telegramBotToken,
+          filePath: telegramFilePath,
+          maxBytes: proxyConfig.imageMaxFileBytes,
         });
+
+        const normalizedMime = mimeType.startsWith("image/") ? mimeType : "image/jpeg";
+        const archived = await archiveImageInWorkspace({
+          agent: activeAgent,
+          chatId,
+          messageId: ctx.message.message_id,
+          bytes,
+          mimeType: normalizedMime,
+          originalName: fileName || undefined,
+          telegramFilePath,
+        });
+        latestArchivedImageByChat.set(chatId, archived.relativePath);
+
+        let analysis = "";
+        try {
+          analysis = await analyzeImageWithOpenAi({
+            client: imageClient,
+            bytes,
+            mimeType: archived.mimeType,
+            caption,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          analysis = `No pude analizar la imagen con el modelo. Detalle: ${message}`;
+        }
+
+        const replyText = [
+          "Listo, ya procese la imagen.",
+          `La guarde como ${archived.relativePath}.`,
+          `Pesa ${formatBytes(archived.bytes)}.`,
+          "",
+          "Esto vi:",
+          analysis,
+          "",
+          `Si despues queres reenviarla como adjunto: /adjuntar #${toHashtagToken(archived.relativePath)}`,
+        ].join("\n");
+
+        await ctx.reply(replyText);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: replyText,
+          source: "proxy-telegram:image-analysis",
+        });
+        logInfo(
+          `Telegram image-document chat=${chatId} user=${userId} archived=${archived.relativePath} bytes=${archived.bytes}`,
+        );
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        analysis = `No pude analizar la imagen con el modelo. Detalle: ${message}`;
+        const replyText = `No pude procesar la imagen: ${message}`;
+        await ctx.reply(replyText);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: replyText,
+          source: "proxy-telegram:image-error",
+        });
+        logError(`Telegram image-document error chat=${chatId} user=${userId}: ${message}`);
       }
-
-      const replyText = [
-        "Imagen procesada.",
-        `Archivo: ${fileReference(archived.relativePath)}`,
-        `Tamano: ${archived.bytes} bytes`,
-        "",
-        "Analisis:",
-        analysis,
-        "",
-        `Para reenviarla como adjunto: /adjuntar #${toHashtagToken(archived.relativePath)}`,
-      ].join("\n");
-
-      await ctx.reply(replyText);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: replyText,
-        source: "proxy-telegram:image-analysis",
-      });
-      logInfo(
-        `Telegram image-document chat=${chatId} user=${userId} archived=${archived.relativePath} bytes=${archived.bytes}`,
-      );
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const replyText = `No pude procesar la imagen: ${message}`;
-      await ctx.reply(replyText);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: replyText,
-        source: "proxy-telegram:image-error",
-      });
-      logError(`Telegram image-document error chat=${chatId} user=${userId}: ${message}`);
-    }
+    });
   });
 
   bot.on("message:voice", async (ctx) => {
@@ -3123,82 +3129,74 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     }
 
     const chatId = ctx.chat.id;
-    const activeAgent = resolveActiveAgent(chatId);
-    const voice = ctx.message.voice;
-    const caption = "";
+    await enqueueChatWork(chatId, "message:voice", async () => {
+      const activeAgent = resolveActiveAgent(chatId);
+      const voice = ctx.message.voice;
+      const caption = "";
 
-    await rememberUser({
-      chatId,
-      userId,
-      text: "[audio-voz]",
-      source: "proxy-telegram:audio-user",
+      await rememberUser({
+        chatId,
+        userId,
+        text: "[audio-voz]",
+        source: "proxy-telegram:audio-user",
+      });
+
+      try {
+        const telegramFile = await ctx.api.getFile(voice.file_id);
+        const telegramFilePath = telegramFile.file_path;
+        if (!telegramFilePath) {
+          throw new Error("Telegram no devolvió file_path para el audio.");
+        }
+
+        const mimeType = (voice.mime_type ?? "audio/ogg").toLowerCase();
+        const bytes = await downloadTelegramFileBuffer({
+          botToken: proxyConfig.telegramBotToken,
+          filePath: telegramFilePath,
+          maxBytes: proxyConfig.audioMaxFileBytes,
+        });
+
+        const fileName = `voice_${chatId}_${ctx.message.message_id}${extensionFromAudioMimeType(mimeType)}`;
+        const transcript = await transcribeAudioWithOpenAi({
+          client: imageClient,
+          bytes,
+          mimeType,
+          fileName,
+        });
+        if (!transcript) {
+          throw new Error("No pude transcribir el audio.");
+        }
+
+        logInfo(`Telegram audio-transcribed chat=${chatId} user=${userId} chars=${transcript.length}`);
+        await ctx.reply(`Transcripción:\n${transcript}`);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: `Transcripción de audio: ${truncateInline(transcript, 2000)}`,
+          source: "proxy-telegram:audio-transcript",
+        });
+
+        const objectiveRaw = caption ? `${transcript}\n\n${caption}` : transcript;
+        await runObjectiveExecution({
+          chatId,
+          userId,
+          activeAgent,
+          objectiveRaw,
+          rememberUserSource: "proxy-telegram:audio-transcript-user",
+          reply: async (replyText: string) => ctx.reply(replyText),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const replyText = `No pude procesar/transcribir el audio: ${message}`;
+        await ctx.reply(replyText);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: replyText,
+          source: "proxy-telegram:audio-error",
+        });
+        logError(`Telegram audio error chat=${chatId} user=${userId}: ${message}`);
+      }
     });
-
-    try {
-      const telegramFile = await ctx.api.getFile(voice.file_id);
-      const telegramFilePath = telegramFile.file_path;
-      if (!telegramFilePath) {
-        throw new Error("Telegram no devolvió file_path para el audio.");
-      }
-
-      const mimeType = (voice.mime_type ?? "audio/ogg").toLowerCase();
-      const bytes = await downloadTelegramFileBuffer({
-        botToken: proxyConfig.telegramBotToken,
-        filePath: telegramFilePath,
-        maxBytes: proxyConfig.audioMaxFileBytes,
-      });
-
-      const fileName = `voice_${chatId}_${ctx.message.message_id}${extensionFromAudioMimeType(mimeType)}`;
-      const transcript = await transcribeAudioWithOpenAi({
-        client: imageClient,
-        bytes,
-        mimeType,
-        fileName,
-      });
-      if (!transcript) {
-        throw new Error("No pude transcribir el audio.");
-      }
-
-      logInfo(`Telegram audio-transcribed chat=${chatId} user=${userId} chars=${transcript.length}`);
-      await ctx.reply(`Transcripción:\n${transcript}`);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: `Transcripción de audio: ${truncateInline(transcript, 2000)}`,
-        source: "proxy-telegram:audio-transcript",
-      });
-
-      const objectiveRaw = caption ? `${transcript}\n\n${caption}` : transcript;
-      const naturalScheduleHandled = await maybeHandleNaturalScheduleInstruction({
-        chatId,
-        userId,
-        text: objectiveRaw,
-        reply: async (replyText: string) => ctx.reply(replyText),
-      });
-      if (naturalScheduleHandled) {
-        return;
-      }
-
-      await runObjectiveExecution({
-        chatId,
-        userId,
-        activeAgent,
-        objectiveRaw,
-        rememberUserSource: "proxy-telegram:audio-transcript-user",
-        reply: async (replyText: string) => ctx.reply(replyText),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const replyText = `No pude procesar/transcribir el audio: ${message}`;
-      await ctx.reply(replyText);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: replyText,
-        source: "proxy-telegram:audio-error",
-      });
-      logError(`Telegram audio error chat=${chatId} user=${userId}: ${message}`);
-    }
   });
 
   bot.on("message:audio", async (ctx) => {
@@ -3208,82 +3206,75 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     }
 
     const chatId = ctx.chat.id;
-    const activeAgent = resolveActiveAgent(chatId);
-    const audio = ctx.message.audio;
-    const caption = (ctx.message.caption ?? "").trim();
+    await enqueueChatWork(chatId, "message:audio", async () => {
+      const activeAgent = resolveActiveAgent(chatId);
+      const audio = ctx.message.audio;
+      const caption = (ctx.message.caption ?? "").trim();
 
-    await rememberUser({
-      chatId,
-      userId,
-      text: caption ? `[audio] ${caption}` : "[audio]",
-      source: "proxy-telegram:audio-user",
+      await rememberUser({
+        chatId,
+        userId,
+        text: caption ? `[audio] ${caption}` : "[audio]",
+        source: "proxy-telegram:audio-user",
+      });
+
+      try {
+        const telegramFile = await ctx.api.getFile(audio.file_id);
+        const telegramFilePath = telegramFile.file_path;
+        if (!telegramFilePath) {
+          throw new Error("Telegram no devolvió file_path para el audio.");
+        }
+
+        const mimeType = (audio.mime_type ?? "audio/mpeg").toLowerCase();
+        const bytes = await downloadTelegramFileBuffer({
+          botToken: proxyConfig.telegramBotToken,
+          filePath: telegramFilePath,
+          maxBytes: proxyConfig.audioMaxFileBytes,
+        });
+
+        const fileName =
+          audio.file_name?.trim() || `audio_${chatId}_${ctx.message.message_id}${extensionFromAudioMimeType(mimeType)}`;
+        const transcript = await transcribeAudioWithOpenAi({
+          client: imageClient,
+          bytes,
+          mimeType,
+          fileName,
+        });
+        if (!transcript) {
+          throw new Error("No pude transcribir el audio.");
+        }
+
+        logInfo(`Telegram audio-transcribed chat=${chatId} user=${userId} chars=${transcript.length}`);
+        await ctx.reply(`Transcripción:\n${transcript}`);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: `Transcripción de audio: ${truncateInline(transcript, 2000)}`,
+          source: "proxy-telegram:audio-transcript",
+        });
+
+        const objectiveRaw = caption ? `${transcript}\n\n${caption}` : transcript;
+        await runObjectiveExecution({
+          chatId,
+          userId,
+          activeAgent,
+          objectiveRaw,
+          rememberUserSource: "proxy-telegram:audio-transcript-user",
+          reply: async (replyText: string) => ctx.reply(replyText),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const replyText = `No pude procesar/transcribir el audio: ${message}`;
+        await ctx.reply(replyText);
+        await rememberAssistant({
+          chatId,
+          userId,
+          text: replyText,
+          source: "proxy-telegram:audio-error",
+        });
+        logError(`Telegram audio error chat=${chatId} user=${userId}: ${message}`);
+      }
     });
-
-    try {
-      const telegramFile = await ctx.api.getFile(audio.file_id);
-      const telegramFilePath = telegramFile.file_path;
-      if (!telegramFilePath) {
-        throw new Error("Telegram no devolvió file_path para el audio.");
-      }
-
-      const mimeType = (audio.mime_type ?? "audio/mpeg").toLowerCase();
-      const bytes = await downloadTelegramFileBuffer({
-        botToken: proxyConfig.telegramBotToken,
-        filePath: telegramFilePath,
-        maxBytes: proxyConfig.audioMaxFileBytes,
-      });
-
-      const fileName = audio.file_name?.trim() || `audio_${chatId}_${ctx.message.message_id}${extensionFromAudioMimeType(mimeType)}`;
-      const transcript = await transcribeAudioWithOpenAi({
-        client: imageClient,
-        bytes,
-        mimeType,
-        fileName,
-      });
-      if (!transcript) {
-        throw new Error("No pude transcribir el audio.");
-      }
-
-      logInfo(`Telegram audio-transcribed chat=${chatId} user=${userId} chars=${transcript.length}`);
-      await ctx.reply(`Transcripción:\n${transcript}`);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: `Transcripción de audio: ${truncateInline(transcript, 2000)}`,
-        source: "proxy-telegram:audio-transcript",
-      });
-
-      const objectiveRaw = caption ? `${transcript}\n\n${caption}` : transcript;
-      const naturalScheduleHandled = await maybeHandleNaturalScheduleInstruction({
-        chatId,
-        userId,
-        text: objectiveRaw,
-        reply: async (replyText: string) => ctx.reply(replyText),
-      });
-      if (naturalScheduleHandled) {
-        return;
-      }
-
-      await runObjectiveExecution({
-        chatId,
-        userId,
-        activeAgent,
-        objectiveRaw,
-        rememberUserSource: "proxy-telegram:audio-transcript-user",
-        reply: async (replyText: string) => ctx.reply(replyText),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const replyText = `No pude procesar/transcribir el audio: ${message}`;
-      await ctx.reply(replyText);
-      await rememberAssistant({
-        chatId,
-        userId,
-        text: replyText,
-        source: "proxy-telegram:audio-error",
-      });
-      logError(`Telegram audio error chat=${chatId} user=${userId}: ${message}`);
-    }
   });
 
   bot.on("message:text", async (ctx) => {
@@ -3306,182 +3297,238 @@ export async function startTerminalProxyTelegramBot(): Promise<void> {
     }
     const normalizedText = normalizeTelegramCommand(text);
 
-    let activeAgent = resolveActiveAgent(chatId);
-
-    if (normalizedText === "/start" || normalizedText === "/help") {
-      await ctx.reply(formatHelp(activeAgent));
+    if (normalizedText === "/status") {
+      await replyLong(async (replyText: string) => ctx.reply(replyText), buildObjectiveStatusText(chatId));
       return;
     }
 
-    if (normalizedText === "/agents") {
-      const lines = ["Agentes disponibles:"];
-      for (const agent of registry.list()) {
-        const marker = agent.name === activeAgent.name ? "*" : "-";
-        lines.push(`${marker} ${agent.name} (cwd=${agent.cwd}, workspaceOnly=${String(agent.workspaceOnly)})`);
-      }
-      await ctx.reply(lines.join("\n"));
-      return;
-    }
-
-    if (normalizedText.startsWith("/agent ")) {
-      const target = normalizedText.replace(/^\/agent\s+/, "").trim();
-      if (!target) {
-        await ctx.reply("Uso: /agent <nombre>");
-        return;
-      }
-      const candidate = registry.get(target);
-      if (!candidate) {
-        await ctx.reply(`Agente no encontrado: ${target}`);
-        return;
-      }
-      activeAgentByChat.set(chatId, candidate.name);
-      activeAgent = candidate;
-      await ctx.reply(`Agente activo: ${candidate.name}`);
-      return;
-    }
-
-    if (normalizedText === "/task" || normalizedText.startsWith("/task ")) {
-      const input = normalizedText.replace(/^\/task\s*/, "").trim();
-      await handleTaskCommand({
+    if (normalizedText === "/cancel") {
+      await requestObjectiveCancel({
         chatId,
-        userId,
-        input,
         reply: async (replyText: string) => ctx.reply(replyText),
+        reason: "cancelado por usuario via /cancel",
       });
       return;
     }
 
-    const naturalScheduleHandled = await maybeHandleNaturalScheduleInstruction({
-      chatId,
-      userId,
-      text: textWithReplyQuote,
-      reply: async (replyText: string) => ctx.reply(replyText),
-    });
-    if (naturalScheduleHandled) {
-      return;
-    }
+    await enqueueChatWork(chatId, "message:text", async () => {
+      let activeAgent = resolveActiveAgent(chatId);
 
-    const attachmentIntent = parseAttachmentIntent(text, normalizedText);
-    const explicitAttachmentCommand = isExplicitAttachmentCommand(normalizedText);
-    const emailIntent = looksLikeEmailIntent(text);
-    const shouldBypassAttachmentFlow =
-      (attachmentIntent.kind === "send" || attachmentIntent.kind === "send_latest") &&
-      emailIntent &&
-      !explicitAttachmentCommand;
-
-    let plannerAttachmentHint = "";
-    if (shouldBypassAttachmentFlow) {
-      let suggestedPath = "";
-      if (attachmentIntent.kind === "send") {
-        suggestedPath = attachmentIntent.target;
-      } else {
-        suggestedPath = latestArchivedImageByChat.get(chatId) ?? ((await findLatestWorkspaceImage(activeAgent)) || "");
+      if (normalizedText === "/start" || normalizedText === "/help") {
+        await ctx.reply(formatHelp(activeAgent));
+        return;
       }
-      if (suggestedPath) {
-        plannerAttachmentHint = `Archivo sugerido en workspace: ${suggestedPath}`;
-      }
-      logInfo(
-        `Telegram attach-flow-bypass chat=${chatId} reason=email-intent explicit=${String(explicitAttachmentCommand)} hint=${plannerAttachmentHint || "-"}`,
-      );
-    }
 
-    if ((attachmentIntent.kind === "send" || attachmentIntent.kind === "send_latest") && !shouldBypassAttachmentFlow) {
-      logInfo(
-        `Telegram attach-flow-enter chat=${chatId} kind=${attachmentIntent.kind} explicit=${String(explicitAttachmentCommand)} emailIntent=${String(emailIntent)}`,
-      );
-      let resolvedTarget = "";
-      let hashtagResolved = false;
-      if (attachmentIntent.kind === "send") {
-        resolvedTarget = attachmentIntent.target;
-      } else {
-        resolvedTarget = latestArchivedImageByChat.get(chatId) ?? "";
-        if (!resolvedTarget) {
-          resolvedTarget = (await findLatestWorkspaceImage(activeAgent)) ?? "";
+      if (normalizedText === "/agents") {
+        const lines = ["Agentes disponibles:"];
+        for (const agent of registry.list()) {
+          const marker = agent.name === activeAgent.name ? "*" : "-";
+          lines.push(`${marker} ${agent.name} (cwd=${agent.cwd}, workspaceOnly=${String(agent.workspaceOnly)})`);
         }
-        if (!resolvedTarget) {
-          await ctx.reply("No tengo una imagen reciente para adjuntar. Enviame una imagen primero.");
+        await ctx.reply(lines.join("\n"));
+        return;
+      }
+
+      if (normalizedText.startsWith("/agent ")) {
+        const target = normalizedText.replace(/^\/agent\s+/, "").trim();
+        if (!target) {
+          await ctx.reply("Uso: /agent <nombre>");
           return;
         }
-      }
-      try {
-        const resolved = await resolveWorkspaceHashtagsInText(resolvedTarget, activeAgent);
-        resolvedTarget = resolved.text;
-        hashtagResolved = resolved.replacements.length > 0;
-        if (resolved.replacements.length > 0) {
-          const mapping = resolved.replacements.map((item) => `${item.tag}->${item.path}`).join(", ");
-          logInfo(`Telegram attach hashtag-resolve chat=${chatId} map="${mapping}"`);
+        const candidate = registry.get(target);
+        if (!candidate) {
+          await ctx.reply(`Agente no encontrado: ${target}`);
+          return;
         }
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        logError(`No pude resolver hashtags para adjunto chat=${chatId}: ${message}`);
+        activeAgentByChat.set(chatId, candidate.name);
+        activeAgent = candidate;
+        await ctx.reply(`Agente activo: ${candidate.name}`);
+        return;
       }
 
-      if (attachmentIntent.kind === "send" && attachmentIntent.target.trim().startsWith("#") && !hashtagResolved) {
-        const fallbackLatest = latestArchivedImageByChat.get(chatId) ?? (await findLatestWorkspaceImage(activeAgent));
-        if (fallbackLatest) {
-          resolvedTarget = fallbackLatest;
+      if (normalizedText === "/task" || normalizedText.startsWith("/task ")) {
+        const input = normalizedText.replace(/^\/task\s*/, "").trim();
+        await handleTaskCommand({
+          chatId,
+          userId,
+          input,
+          reply: async (replyText: string) => ctx.reply(replyText),
+        });
+        return;
+      }
+
+      const pendingApproval = objectiveState.getSemanticState(chatId)?.pendingApproval;
+      if (pendingApproval) {
+        const approvalDecision = parseApprovalReply(text);
+        if (approvalDecision) {
+          if (pendingApproval.expiresAtMs <= Date.now()) {
+            objectiveState.clearPendingApproval(chatId);
+            const replyText = "Esa confirmación ya venció. Si querés, pedímelo de nuevo.";
+            await ctx.reply(replyText);
+            await rememberAssistant({
+              chatId,
+              userId,
+              text: replyText,
+              source: "proxy-telegram:approval-expired",
+            });
+            return;
+          }
+
+          objectiveState.clearPendingApproval(chatId);
+          if (approvalDecision === "deny") {
+            const replyText = "Listo, no sigo con eso.";
+            await ctx.reply(replyText);
+            await rememberAssistant({
+              chatId,
+              userId,
+              text: replyText,
+              source: "proxy-telegram:approval-denied",
+            });
+            return;
+          }
+
+          const approvedAgent = registry.get(pendingApproval.activeAgent) ?? activeAgent;
+          activeAgentByChat.set(chatId, approvedAgent.name);
+          activeAgent = approvedAgent;
+          await ctx.reply("Listo, sigo con eso.");
+          await runObjectiveExecution({
+            chatId,
+            userId,
+            activeAgent,
+            objectiveRaw: pendingApproval.originalObjective,
+            plannerAttachmentHint: pendingApproval.plannerAttachmentHint,
+            approvedCapabilities: new Set([pendingApproval.capability]),
+            reply: async (replyText: string) => ctx.reply(replyText),
+            rememberUserSource: undefined,
+          });
+          return;
+        }
+
+        objectiveState.clearPendingApproval(chatId);
+      }
+
+      const attachmentIntent = parseAttachmentIntent(text, normalizedText);
+      const explicitAttachmentCommand = isExplicitAttachmentCommand(normalizedText);
+      const emailIntent = looksLikeEmailIntent(text);
+      const shouldBypassAttachmentFlow =
+        (attachmentIntent.kind === "send" || attachmentIntent.kind === "send_latest") &&
+        emailIntent &&
+        !explicitAttachmentCommand;
+
+      let plannerAttachmentHint = "";
+      if (shouldBypassAttachmentFlow) {
+        let suggestedPath = "";
+        if (attachmentIntent.kind === "send") {
+          suggestedPath = attachmentIntent.target;
         } else {
-          const replyText = [
-            `No pude resolver ${attachmentIntent.target} a un archivo actual del workspace.`,
-            "Es probable que el workspace se haya reiniciado y el archivo ya no exista.",
-            "Enviame la imagen de nuevo o usa /adjuntar sin hashtag.",
-          ].join("\n");
+          suggestedPath = latestArchivedImageByChat.get(chatId) ?? ((await findLatestWorkspaceImage(activeAgent)) || "");
+        }
+        if (suggestedPath) {
+          plannerAttachmentHint = `Archivo sugerido en workspace: ${suggestedPath}`;
+        }
+        logInfo(
+          `Telegram attach-flow-bypass chat=${chatId} reason=email-intent explicit=${String(explicitAttachmentCommand)} hint=${plannerAttachmentHint || "-"}`,
+        );
+      }
+
+      if ((attachmentIntent.kind === "send" || attachmentIntent.kind === "send_latest") && !shouldBypassAttachmentFlow) {
+        logInfo(
+          `Telegram attach-flow-enter chat=${chatId} kind=${attachmentIntent.kind} explicit=${String(explicitAttachmentCommand)} emailIntent=${String(emailIntent)}`,
+        );
+        let resolvedTarget = "";
+        let hashtagResolved = false;
+        if (attachmentIntent.kind === "send") {
+          resolvedTarget = attachmentIntent.target;
+        } else {
+          resolvedTarget = latestArchivedImageByChat.get(chatId) ?? "";
+          if (!resolvedTarget) {
+            resolvedTarget = (await findLatestWorkspaceImage(activeAgent)) ?? "";
+          }
+          if (!resolvedTarget) {
+            await ctx.reply("No tengo una imagen reciente para adjuntar. Enviame una imagen primero.");
+            return;
+          }
+        }
+        try {
+          const resolved = await resolveWorkspaceHashtagsInText(resolvedTarget, activeAgent);
+          resolvedTarget = resolved.text;
+          hashtagResolved = resolved.replacements.length > 0;
+          if (resolved.replacements.length > 0) {
+            const mapping = resolved.replacements.map((item) => `${item.tag}->${item.path}`).join(", ");
+            logInfo(`Telegram attach hashtag-resolve chat=${chatId} map="${mapping}"`);
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logError(`No pude resolver hashtags para adjunto chat=${chatId}: ${message}`);
+        }
+
+        if (attachmentIntent.kind === "send" && attachmentIntent.target.trim().startsWith("#") && !hashtagResolved) {
+          const fallbackLatest = latestArchivedImageByChat.get(chatId) ?? (await findLatestWorkspaceImage(activeAgent));
+          if (fallbackLatest) {
+            resolvedTarget = fallbackLatest;
+          } else {
+            const replyText = [
+              `No pude resolver ${attachmentIntent.target} a un archivo actual del workspace.`,
+              "Es probable que el workspace se haya reiniciado y el archivo ya no exista.",
+              "Enviame la imagen de nuevo o usa /adjuntar sin hashtag.",
+            ].join("\n");
+            await ctx.reply(replyText);
+            await rememberAssistant({
+              chatId,
+              userId,
+              text: replyText,
+              source: "proxy-telegram:attach-error",
+            });
+            return;
+          }
+        }
+
+        try {
+          const relativePath = await sendWorkspaceAttachment(ctx, activeAgent, resolvedTarget);
+          const replyText = `Listo, te mande el adjunto ${relativePath}.`;
           await ctx.reply(replyText);
+          logInfo(`Telegram attach-flow-sent chat=${chatId} path=${relativePath}`);
+          await rememberUser({
+            chatId,
+            userId,
+            text,
+            source: "proxy-telegram:attach-user",
+          });
           await rememberAssistant({
             chatId,
             userId,
             text: replyText,
+            source: "proxy-telegram:attach-sent",
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const isMissingFile = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+          const friendlyMessage = isMissingFile
+            ? "No encuentro ese archivo en workspace. Si reiniciaste el bot, reenviame la imagen o usa /adjuntar sin hashtag."
+            : message;
+          const replyText = `No pude enviar el adjunto: ${message}`;
+          const replyTextUser = isMissingFile ? `No pude enviar el adjunto: ${friendlyMessage}` : replyText;
+          await ctx.reply(replyTextUser);
+          logError(`Telegram attach-flow-error chat=${chatId} detail=${message}`);
+          await rememberAssistant({
+            chatId,
+            userId,
+            text: replyTextUser,
             source: "proxy-telegram:attach-error",
           });
-          return;
         }
+        return;
       }
 
-      try {
-        const relativePath = await sendWorkspaceAttachment(ctx, activeAgent, resolvedTarget);
-        const replyText = `Adjunto enviado: ${fileReference(relativePath)}`;
-        await ctx.reply(replyText);
-        logInfo(`Telegram attach-flow-sent chat=${chatId} path=${relativePath}`);
-        await rememberUser({
-          chatId,
-          userId,
-          text,
-          source: "proxy-telegram:attach-user",
-        });
-        await rememberAssistant({
-          chatId,
-          userId,
-          text: replyText,
-          source: "proxy-telegram:attach-sent",
-        });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        const isMissingFile = typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-        const friendlyMessage = isMissingFile
-          ? "No encuentro ese archivo en workspace. Si reiniciaste el bot, reenviame la imagen o usa /adjuntar sin hashtag."
-          : message;
-        const replyText = `No pude enviar el adjunto: ${message}`;
-        const replyTextUser = isMissingFile ? `No pude enviar el adjunto: ${friendlyMessage}` : replyText;
-        await ctx.reply(replyTextUser);
-        logError(`Telegram attach-flow-error chat=${chatId} detail=${message}`);
-        await rememberAssistant({
-          chatId,
-          userId,
-          text: replyTextUser,
-          source: "proxy-telegram:attach-error",
-        });
-      }
-      return;
-    }
-
-    await runObjectiveExecution({
-      chatId,
-      userId,
-      activeAgent,
-      objectiveRaw: textWithReplyQuote,
-      plannerAttachmentHint,
-      rememberUserSource: "proxy-telegram:user",
-      reply: async (replyText: string) => ctx.reply(replyText),
+      await runObjectiveExecution({
+        chatId,
+        userId,
+        activeAgent,
+        objectiveRaw: textWithReplyQuote,
+        plannerAttachmentHint,
+        rememberUserSource: "proxy-telegram:user",
+        reply: async (replyText: string) => ctx.reply(replyText),
+      });
     });
   });
 

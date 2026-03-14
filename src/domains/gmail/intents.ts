@@ -258,6 +258,20 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
   const inboxCheckVerb = /\b(revisa|revisar|chequea|chequear|checkea|checkear|mira|mirar|verifica|verificar)\b/.test(
     normalized,
   );
+  const labeled = deps.parseGmailLabeledFields(original);
+  const explicitLiteralBody = deps.extractLiteralBodyRequest(original);
+  const explicitNaturalSubject = deps.extractNaturalSubjectRequest(original);
+  const hasStructuredSendFields =
+    labeled.hasSubjectLabel || labeled.hasBodyLabel || Boolean(labeled.cc) || Boolean(labeled.bcc) || Boolean(explicitLiteralBody);
+  const hasStructuredSendWithoutVerb =
+    emailCandidates.length > 0 &&
+    hasStructuredSendFields &&
+    !markReadVerb &&
+    !markUnreadVerb &&
+    !trashVerb &&
+    !untrashVerb &&
+    !starVerb &&
+    !unstarVerb;
 
   if (hasMailContext && statusVerb) {
     return { shouldHandle: true, action: "status" };
@@ -266,7 +280,7 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
     return { shouldHandle: true, action: "profile" };
   }
 
-  if (sendVerb && (hasMailContext || emailCandidates.length > 0 || implicitSelfMailRequest)) {
+  if ((sendVerb && (hasMailContext || emailCandidates.length > 0 || implicitSelfMailRequest)) || hasStructuredSendWithoutVerb) {
     const inferredSelfTo = deps.inferDefaultSelfEmailRecipient(original);
     const autoContentKind = deps.detectGmailAutoContentKind(normalized);
     const recipientName = deps.extractRecipientNameFromText(original);
@@ -280,15 +294,12 @@ export function detectGmailNaturalIntent(text: string, deps: GmailIntentDeps): G
     let cc = "";
     let bcc = "";
     let draftInstruction = "";
-    const explicitLiteralBody = deps.extractLiteralBodyRequest(original);
-    const explicitNaturalSubject = deps.extractNaturalSubjectRequest(original);
     const creativeCue = deps.detectCreativeEmailCue(normalized);
 
     if (quotedSegments.length >= 2) {
       subject = quotedSegments[0] ?? "";
       body = quotedSegments.slice(1).join("\n\n").trim();
     } else {
-      const labeled = deps.parseGmailLabeledFields(original);
       subject = labeled.subject;
       body = labeled.body;
       cc = labeled.cc;

@@ -2,7 +2,11 @@ import process from "node:process";
 import readline from "node:readline/promises";
 import type { AgentProfile } from "../agents.js";
 import { logError, logInfo } from "../logger.js";
+import { buildVisiblePlanHeader } from "./agentic-helpers.js";
 import { proxyConfig } from "./config.js";
+import { critiquePlannedCommands } from "./intent-critic.js";
+import { buildIntentIr, shouldAbstainIntent, stripQuotedExecutionNoise, type IntentIr } from "./intent-ir.js";
+import { buildIntentPlannerContextBlock, buildRetryPlannerObjective, shouldRetryPlannerReply } from "./intent-planning.js";
 import { nextLoopGuardState } from "./loop-guard.js";
 import { resolveCliMemoryChatId } from "./memory.js";
 import { createProxyRuntime } from "./runtime.js";
@@ -31,33 +35,33 @@ function truncateForConsole(text: string, maxChars = 5000): string {
   return `${text.slice(0, maxChars)}\n...[truncado]`;
 }
 
-function renderExecution(result: ExecutedCommand): void {
-  process.stdout.write(`\n$ ${result.command}\n`);
+function renderExecution(result: ExecutedCommand, write: (text: string) => void): void {
+  write(`\n$ ${result.command}\n`);
 
   const stdout = result.stdout.trimEnd();
   const stderr = result.stderr.trimEnd();
 
   if (stdout) {
-    process.stdout.write(`${truncateForConsole(stdout)}\n`);
+    write(`${truncateForConsole(stdout)}\n`);
   } else {
-    process.stdout.write("(sin stdout)\n");
+    write("(sin stdout)\n");
   }
 
   if (stderr) {
-    process.stdout.write(`[stderr]\n${truncateForConsole(stderr)}\n`);
+    write(`[stderr]\n${truncateForConsole(stderr)}\n`);
   }
 
   if (result.timedOut) {
-    process.stdout.write("[timeout]\n");
+    write("[timeout]\n");
     return;
   }
 
   if (result.exitCode === null) {
-    process.stdout.write(`[signal ${result.signal ?? "unknown"}]\n`);
+    write(`[signal ${result.signal ?? "unknown"}]\n`);
     return;
   }
 
-  process.stdout.write(`[exit ${result.exitCode}]\n`);
+  write(`[exit ${result.exitCode}]\n`);
 }
 
 async function requestConfirmation(rl: readline.Interface): Promise<boolean> {
@@ -65,7 +69,7 @@ async function requestConfirmation(rl: readline.Interface): Promise<boolean> {
   return ["s", "si", "sí", "y", "yes"].includes(answer);
 }
 
-async function runObjective(params: {
+export async function runObjective(params: {
   objective: string;
   agent: AgentProfile;
   planner: Awaited<ReturnType<typeof createProxyRuntime>>["planner"];
@@ -74,7 +78,11 @@ async function runObjective(params: {
   memory: Awaited<ReturnType<typeof createProxyRuntime>>["memory"];
   webApi: Awaited<ReturnType<typeof createProxyRuntime>>["webApi"];
   rl: readline.Interface;
+  write?: (text: string) => void;
 }): Promise<void> {
+  const write = params.write ?? ((text: string) => {
+    process.stdout.write(text);
+  });
   const objectiveRaw = params.objective.trim();
   if (!objectiveRaw) {
     return;
@@ -84,7 +92,7 @@ async function runObjective(params: {
     const resolved = await resolveWorkspaceHashtagsInText(objectiveRaw, params.agent);
     objective = resolved.text;
     if (resolved.replacements.length > 0) {
-      process.stdout.write(
+      write(
         `\nReferencias resueltas: ${resolved.replacements.map((item) => `${item.tag} -> ${item.path}`).join(", ")}\n`,
       );
     }
@@ -128,10 +136,24 @@ async function runObjective(params: {
   const history: ExecutedCommand[] = [];
   let guard = { lastSignature: "", repeatedCount: 0 };
   let executedCommandsTotal = 0;
+  const routingText = stripQuotedExecutionNoise(objective);
+  const intent = buildIntentIr(routingText);
+  const shadowIntent = proxyConfig.intentShadowEnabled ? buildIntentIr(routingText, { shadow: true }) : undefined;
+  const intentPlannerBlock = buildIntentPlannerContextBlock(intent, shadowIntent);
+  const abstention = shouldAbstainIntent(intent, proxyConfig.intentAbstainThreshold);
+  if (abstention.abstain) {
+    const clarification =
+      abstention.clarification ??
+      "No estoy seguro de la intención y prefiero confirmar antes de ejecutar. Reformula el objetivo en una frase.";
+    write(`\n${clarification}\n`);
+    await rememberAssistant(clarification, "proxy-cli:intent-abstain");
+    return;
+  }
 
   for (let iteration = 1; iteration <= proxyConfig.maxIterations; iteration += 1) {
-    const plan = await params.planner.plan({
-      objective,
+    const objectiveForPlanner = [objective, intentPlannerBlock].filter(Boolean).join("\n\n");
+    let plan = await params.planner.plan({
+      objective: objectiveForPlanner,
       agent: params.agent,
       history,
       iteration,
@@ -141,36 +163,94 @@ async function runObjective(params: {
     });
 
     if (plan.action === "reply") {
+      const replyText = (plan.reply ?? "").trim();
+      if (
+        shouldRetryPlannerReply({
+          intent,
+          iteration,
+          replyText,
+        })
+      ) {
+        const retriedPlan = await params.planner.plan({
+          objective: buildRetryPlannerObjective(objectiveForPlanner),
+          agent: params.agent,
+          history,
+          iteration,
+          memoryHits,
+          recentConversation,
+          webApi: params.webApi?.plannerContext ?? null,
+        });
+        if (retriedPlan.action !== "reply") {
+          const retryCommands = retriedPlan.commands ?? [];
+          const criticRetry =
+            retriedPlan.action === "commands" && proxyConfig.intentCriticEnabled
+              ? critiquePlannedCommands({
+                  intent,
+                  objective,
+                  plan: retriedPlan,
+                })
+              : null;
+          if (!criticRetry || criticRetry.allow) {
+            write(
+              `\nReintentando con plan ejecutable por intención detectada (${intent.domain}/${intent.action}).\n`,
+            );
+            plan = {
+              action: retriedPlan.action,
+              explanation: retriedPlan.explanation,
+              reply: retriedPlan.reply,
+              commands: retryCommands,
+            };
+          }
+        }
+      }
+    }
+
+    if (plan.action === "reply") {
       const replyText = plan.reply ?? "No tengo una respuesta para eso.";
-      process.stdout.write(`\n${replyText}\n`);
+      write(`\n${replyText}\n`);
       await rememberAssistant(replyText, "proxy-cli:reply");
       return;
     }
 
     if (plan.action === "done") {
       const doneText = plan.reply ?? "Objetivo completado.";
-      process.stdout.write(`\n${doneText}\n`);
+      write(`\n${doneText}\n`);
       await rememberAssistant(doneText, "proxy-cli:done");
       return;
     }
 
     const commands = plan.commands ?? [];
+    if (proxyConfig.intentCriticEnabled) {
+      const critic = critiquePlannedCommands({
+        intent,
+        objective,
+        plan,
+      });
+      if (!critic.allow) {
+        const clarification =
+          critic.clarification ??
+          "Detuve la ejecución porque el plan no coincide con la intención detectada. Reformula el objetivo.";
+        write(`\n${clarification}\n`);
+        await rememberAssistant(clarification, "proxy-cli:intent-critic-block");
+        return;
+      }
+    }
     const remaining = Math.max(0, proxyConfig.maxCommandsTotal - executedCommandsTotal);
     if (remaining <= 0) {
       const text = `Límite alcanzado: ${proxyConfig.maxCommandsTotal} comandos ejecutados para este objetivo.`;
-      process.stdout.write(`\n${text}\n`);
+      write(`\n${text}\n`);
       await rememberAssistant(text, "proxy-cli:limit");
       return;
     }
     const commandsToRun = commands.slice(0, remaining);
 
-    process.stdout.write(`\nPlan (${iteration}/${proxyConfig.maxIterations}):\n${plan.explanation ?? ""}\n`);
-    process.stdout.write("Comandos:\n");
+    write(`\n${buildVisiblePlanHeader(iteration)}\n${plan.explanation ?? ""}\n`);
+    write("Comandos:\n");
     commandsToRun.forEach((command, index) => {
-      process.stdout.write(`${index + 1}. ${command}\n`);
+      write(`${index + 1}. ${command}\n`);
     });
     if (commandsToRun.length < commands.length) {
-      process.stdout.write(
+      write(
         `Aviso: truncado por límite total, ejecutando ${commandsToRun.length} de ${commands.length} comandos.\n`,
       );
     }
@@ -179,7 +259,7 @@ async function runObjective(params: {
       const approved = await requestConfirmation(params.rl);
       if (!approved) {
         const text = "Ejecución cancelada por el usuario.";
-        process.stdout.write(`${text}\n`);
+        write(`${text}\n`);
         await rememberAssistant(text, "proxy-cli:cancelled");
         return;
       }
@@ -191,7 +271,7 @@ async function runObjective(params: {
 
     for (const result of results) {
       const presentable = await presentListingResultForWorkspace(result, params.agent);
-      renderExecution(presentable);
+      renderExecution(presentable, write);
     }
 
     const verification = await params.verifier.verify({
@@ -203,12 +283,12 @@ async function runObjective(params: {
       history,
     });
     if (verification.status === "success") {
-      process.stdout.write(`\n${verification.summary}\n`);
+      write(`\n${verification.summary}\n`);
       await rememberAssistant(verification.summary, "proxy-cli:verify-success");
       return;
     }
     if (verification.status === "blocked") {
-      process.stdout.write(`\n${verification.summary}\n`);
+      write(`\n${verification.summary}\n`);
       await rememberAssistant(verification.summary, "proxy-cli:verify-blocked");
       return;
     }
@@ -218,14 +298,14 @@ async function runObjective(params: {
     if (guardResult.shouldStop) {
       const text =
         "Detuve la ejecución porque la secuencia y el resultado se repitieron. El objetivo parece resuelto o estancado.";
-      process.stdout.write(`\n${text}\n`);
+      write(`\n${text}\n`);
       await rememberAssistant(text, "proxy-cli:loop-guard");
       return;
     }
   }
 
   const text = `No se completó el objetivo en ${proxyConfig.maxIterations} iteraciones. Reformula o amplía el objetivo.`;
-  process.stdout.write(`\n${text}\n`);
+  write(`\n${text}\n`);
   await rememberAssistant(text, "proxy-cli:max-iterations");
 }
 

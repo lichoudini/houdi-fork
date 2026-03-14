@@ -1,5 +1,6 @@
 {
   "name": "houdi-agent",
+  "description": "Experimental de Houdi Agent",
   "version": "0.63b",
   "author": "licHoudini",
   "license": "MIT",

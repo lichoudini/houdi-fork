@@ -7,8 +7,16 @@ import { proxyConfig } from "./config.js";
 
 export type ProxyWebApiPlannerContext = {
   baseUrl: string;
-  bearerToken?: string;
+  authMode: "none" | "runtime-managed";
 };
+
+type ReusableProxyWebApiCheck = {
+  ok: boolean;
+  reason: string;
+};
+
+const PROXY_WEB_API_SERVICE = "proxy-web-api";
+const PROXY_WEB_API_META_VERSION = 1;
 
 function errorCodeOf(error: unknown): string {
   if (!error || typeof error !== "object") {
@@ -47,6 +55,148 @@ function normalizePlannerHost(hostInput: string): string {
     return "127.0.0.1";
   }
   return host;
+}
+
+function stripTrailingSlash(value: string): string {
+  return value.replace(/\/+$/g, "");
+}
+
+export function buildProxyWebApiBaseUrls(): string[] {
+  const out = new Set<string>();
+  const plannerHost = normalizePlannerHost(proxyConfig.webApiHost);
+  out.add(`http://${plannerHost}:${proxyConfig.webApiPort}`);
+  out.add(`http://127.0.0.1:${proxyConfig.webApiPort}`);
+  out.add(`http://localhost:${proxyConfig.webApiPort}`);
+  return [...out];
+}
+
+function commandTargetsProxyWebApi(command: string, baseUrls: string[]): boolean {
+  const normalized = stripTrailingSlash(command.trim());
+  return baseUrls.some((baseUrl) => {
+    const base = stripTrailingSlash(baseUrl);
+    return normalized.includes(`${base}/api/`) || normalized.includes(`${base}/web/`);
+  });
+}
+
+function hasAuthorizationHeader(command: string): boolean {
+  return /(?:^|\s)(?:-H|--header)\s+["']?Authorization:/i.test(command);
+}
+
+export function rewriteProxyWebApiCurlCommandForRuntime(
+  command: string,
+  options: {
+    bearerToken?: string;
+    baseUrls?: string[];
+  } = {},
+): string {
+  const bearerToken = options.bearerToken ?? proxyConfig.webApiToken;
+  if (!bearerToken || !/^\s*curl\b/i.test(command)) {
+    return command;
+  }
+
+  const baseUrls = options.baseUrls ?? buildProxyWebApiBaseUrls();
+  if (!commandTargetsProxyWebApi(command, baseUrls) || hasAuthorizationHeader(command)) {
+    return command;
+  }
+
+  return command.replace(/^\s*curl\b/i, `curl -H "Authorization: Bearer ${bearerToken}"`);
+}
+
+function metaPayload(): {
+  ok: true;
+  service: string;
+  metaVersion: number;
+  authMode: "none" | "token";
+  routes: string[];
+} {
+  return {
+    ok: true,
+    service: PROXY_WEB_API_SERVICE,
+    metaVersion: PROXY_WEB_API_META_VERSION,
+    authMode: proxyConfig.webApiToken ? "token" : "none",
+    routes: ["/api/web/search", "/api/web/open", "/api/meta"],
+  };
+}
+
+export async function validateReusableProxyWebApiEndpoint(params: {
+  plannerContext: ProxyWebApiPlannerContext;
+  expectedToken?: string;
+  timeoutMs?: number;
+}): Promise<ReusableProxyWebApiCheck> {
+  const timeoutMs = Math.max(250, Math.min(params.timeoutMs ?? 1_500, 5_000));
+  const expectedToken = params.expectedToken ?? proxyConfig.webApiToken;
+  const metaUrl = `${stripTrailingSlash(params.plannerContext.baseUrl)}/api/meta`;
+  const expectedAuthMode = expectedToken ? "token" : "none";
+
+  const fetchJson = async (withAuth: boolean): Promise<Response> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(metaUrl, {
+        method: "GET",
+        headers: withAuth && expectedToken ? { Authorization: `Bearer ${expectedToken}` } : {},
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  try {
+    if (expectedToken) {
+      const unauthorized = await fetchJson(false);
+      if (unauthorized.status !== 401) {
+        return {
+          ok: false,
+          reason: `meta auth mismatch (status sin token=${unauthorized.status})`,
+        };
+      }
+    }
+
+    const response = await fetchJson(Boolean(expectedToken));
+    if (!response.ok) {
+      return {
+        ok: false,
+        reason: `meta status inválido (${response.status})`,
+      };
+    }
+
+    const payload = (await response.json()) as {
+      ok?: unknown;
+      service?: unknown;
+      metaVersion?: unknown;
+      authMode?: unknown;
+    };
+    if (payload.ok !== true || payload.service !== PROXY_WEB_API_SERVICE) {
+      return {
+        ok: false,
+        reason: "meta payload no corresponde a proxy-web-api",
+      };
+    }
+    if (payload.metaVersion !== PROXY_WEB_API_META_VERSION) {
+      return {
+        ok: false,
+        reason: `metaVersion incompatible (${String(payload.metaVersion)})`,
+      };
+    }
+    if (payload.authMode !== expectedAuthMode) {
+      return {
+        ok: false,
+        reason: `authMode incompatible (${String(payload.authMode)})`,
+      };
+    }
+
+    return {
+      ok: true,
+      reason: "endpoint reutilizable verificado",
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      reason: `probe falló: ${message}`,
+    };
+  }
 }
 
 function parseSearchQuery(searchParams: URLSearchParams): string {
@@ -92,10 +242,13 @@ export async function startProxyWebApiServer(): Promise<ProxyWebApiServer | null
 
     if (method === "GET" && (pathname === "/health" || pathname === "/api/health")) {
       writeJsonResponse(res, 200, {
-        ok: true,
-        service: "proxy-web-api",
-        routes: ["/api/web/search", "/api/web/open"],
+        ...metaPayload(),
       });
+      return;
+    }
+
+    if (method === "GET" && pathname === "/api/meta") {
+      writeJsonResponse(res, 200, metaPayload());
       return;
     }
 
@@ -206,7 +359,7 @@ export async function startProxyWebApiServer(): Promise<ProxyWebApiServer | null
   const plannerHost = normalizePlannerHost(proxyConfig.webApiHost);
   const plannerContext: ProxyWebApiPlannerContext = {
     baseUrl: `http://${plannerHost}:${proxyConfig.webApiPort}`,
-    ...(proxyConfig.webApiToken ? { bearerToken: proxyConfig.webApiToken } : {}),
+    authMode: proxyConfig.webApiToken ? "runtime-managed" : "none",
   };
 
   try {
@@ -218,10 +371,17 @@ export async function startProxyWebApiServer(): Promise<ProxyWebApiServer | null
     const message = error instanceof Error ? error.message : String(error);
     const code = errorCodeOf(error);
     if (code === "EADDRINUSE" || /EADDRINUSE/.test(message)) {
-      logInfo(
-        `Proxy Web API ya está ocupando ${proxyConfig.webApiHost}:${proxyConfig.webApiPort}; reutilizando endpoint existente.`,
+      const reusable = await validateReusableProxyWebApiEndpoint({ plannerContext });
+      if (reusable.ok) {
+        logInfo(
+          `Proxy Web API ya está ocupando ${proxyConfig.webApiHost}:${proxyConfig.webApiPort}; reutilizando endpoint verificado.`,
+        );
+        return new ProxyWebApiServer(null, plannerContext);
+      }
+      logError(
+        `Proxy Web API ocupada en ${proxyConfig.webApiHost}:${proxyConfig.webApiPort}, pero el endpoint no pasó validación (${reusable.reason}). Continúo sin Web API local.`,
       );
-      return new ProxyWebApiServer(null, plannerContext);
+      return null;
     }
     if (code === "EACCES" || code === "EPERM" || /EACCES|EPERM/.test(message)) {
       logError(

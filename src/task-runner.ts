@@ -225,18 +225,11 @@ export class TaskRunner {
           }
         : {}),
     };
-    const allowShellSyntax = allowsAll && !profile.workspaceOnly;
-    const child = allowShellSyntax
-      ? (spawn(rawInput, {
-          cwd,
-          shell: true,
-          env,
-        }) as ChildProcessWithoutNullStreams)
-      : spawn(command, args, {
-          cwd,
-          shell: false,
-          env,
-        });
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
+      env,
+    });
 
     const task: Task = {
       id: buildTaskId(),

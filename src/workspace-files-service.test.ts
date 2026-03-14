@@ -202,6 +202,31 @@ test("workspace files service keeps unresolved for non-exact candidate", async (
   await fs.rm(tempDir, { recursive: true, force: true });
 });
 
+test("workspace files service resolves fuzzy suffix candidate with extension filter", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-fuzzy-"));
+  const service = new WorkspaceFilesService(
+    tempDir,
+    normalizeWorkspaceRelativePath,
+    isSimpleTextFilePath,
+    (bytes) => `${bytes}b`,
+    safePathExists,
+    new Set([".txt", ".json", ".md", ".csv", ".jsonl", ".log", ".jpg"]),
+  );
+  await service.createWorkspaceDirectory("images");
+  await service.writeWorkspaceTextFile({ relativePath: "images/imagen_5939.txt", content: "descartar" });
+  await fs.writeFile(path.join(tempDir, "images", "imagen_8482923834_5472_20260306_235939.jpg"), "bin");
+
+  const resolved = await service.resolveExistingPathCandidate("5939", {
+    allowFuzzy: true,
+    extensionFilters: [".jpg"],
+  });
+  assert.equal(resolved.ambiguous, false);
+  assert.equal(resolved.expanded, true);
+  assert.equal(resolved.resolvedPath, "images/imagen_8482923834_5472_20260306_235939.jpg");
+
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
 test("workspace files service formats entries with touch-friendly hash reference", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "houdi-workspace-service-format-"));
   const service = new WorkspaceFilesService(

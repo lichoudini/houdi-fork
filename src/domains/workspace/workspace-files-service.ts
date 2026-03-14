@@ -17,6 +17,11 @@ type ExistingPathResolution = {
   matches: string[];
 };
 
+type ExistingPathResolutionOptions = {
+  allowFuzzy?: boolean;
+  extensionFilters?: string[];
+};
+
 export class WorkspaceFilesService {
   constructor(
     private readonly workspaceRoot: string,
@@ -144,7 +149,10 @@ export class WorkspaceFilesService {
     };
   }
 
-  async resolveExistingPathCandidate(relativeInput: string): Promise<ExistingPathResolution> {
+  async resolveExistingPathCandidate(
+    relativeInput: string,
+    options: ExistingPathResolutionOptions = {},
+  ): Promise<ExistingPathResolution> {
     const inputPath = this.normalizeWorkspaceRelativePath(relativeInput);
     if (!inputPath) {
       return { inputPath: "", resolvedPath: "", expanded: false, ambiguous: false, matches: [] };
@@ -161,8 +169,52 @@ export class WorkspaceFilesService {
         matches: [inputPath],
       };
     } catch {
+      if (!options.allowFuzzy) {
+        return { inputPath, resolvedPath: inputPath, expanded: false, ambiguous: false, matches: [] };
+      }
+    }
+
+    const allPaths = await collectWorkspaceRelativePaths(this.workspaceRoot);
+    const extensionFilters = new Set(
+      (options.extensionFilters ?? [])
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean),
+    );
+    const filteredPaths = extensionFilters.size === 0
+      ? allPaths
+      : allPaths.filter((candidate) => extensionFilters.has(path.extname(candidate).toLowerCase()));
+    const ranked = filteredPaths
+      .map((candidatePath) => ({
+        path: candidatePath,
+        score: scoreExistingPathCandidate(inputPath, candidatePath),
+      }))
+      .filter((item) => item.score > 0)
+      .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path, "es", { sensitivity: "base" }));
+
+    if (ranked.length === 0) {
       return { inputPath, resolvedPath: inputPath, expanded: false, ambiguous: false, matches: [] };
     }
+
+    const bestScore = ranked[0]?.score ?? 0;
+    const bestMatches = ranked.filter((item) => item.score === bestScore);
+    if (bestMatches.length === 1) {
+      const resolvedPath = bestMatches[0]?.path ?? inputPath;
+      return {
+        inputPath,
+        resolvedPath,
+        expanded: resolvedPath !== inputPath,
+        ambiguous: false,
+        matches: [resolvedPath],
+      };
+    }
+
+    return {
+      inputPath,
+      resolvedPath: inputPath,
+      expanded: false,
+      ambiguous: true,
+      matches: bestMatches.map((item) => item.path),
+    };
   }
 
   async listWorkspaceDirectory(relativeInput?: string): Promise<{ relPath: string; entries: WorkspaceEntry[]; truncated: boolean }> {
@@ -318,4 +370,78 @@ function isOrderedSubsequence(needle: string, haystack: string): boolean {
     }
   }
   return false;
+}
+
+async function collectWorkspaceRelativePaths(workspaceRoot: string): Promise<string[]> {
+  const collected: string[] = [];
+  await walkWorkspaceTree(workspaceRoot, "", collected);
+  return collected;
+}
+
+async function walkWorkspaceTree(absoluteDir: string, relativePrefix: string, collected: string[]): Promise<void> {
+  const entries = await fs.readdir(absoluteDir, { withFileTypes: true });
+  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name, "es", { sensitivity: "base" }))) {
+    if (!entry.name || entry.name.startsWith(".")) {
+      continue;
+    }
+    const relativePath = relativePrefix ? `${relativePrefix}/${entry.name}` : entry.name;
+    collected.push(relativePath);
+    if (entry.isDirectory()) {
+      await walkWorkspaceTree(path.join(absoluteDir, entry.name), relativePath, collected);
+    }
+  }
+}
+
+function stripExtensionForMatch(value: string): string {
+  const parsed = value.replace(/\/+$/g, "");
+  const ext = path.extname(parsed);
+  if (!ext) {
+    return parsed;
+  }
+  return parsed.slice(0, -ext.length);
+}
+
+function scoreExistingPathCandidate(inputPath: string, candidatePath: string): number {
+  const inputNormalized = normalizeForPathMatch(inputPath);
+  const candidateNormalized = normalizeForPathMatch(candidatePath);
+  if (!inputNormalized || !candidateNormalized) {
+    return 0;
+  }
+  if (candidateNormalized === inputNormalized) {
+    return 100;
+  }
+  if (candidateNormalized.endsWith(`/${inputNormalized}`)) {
+    return 95;
+  }
+
+  const inputBase = normalizeForPathMatch(path.basename(inputPath));
+  const candidateBase = normalizeForPathMatch(path.basename(candidatePath));
+  const inputStem = normalizeForPathMatch(stripExtensionForMatch(path.basename(inputPath)));
+  const candidateStem = normalizeForPathMatch(stripExtensionForMatch(path.basename(candidatePath)));
+
+  if (inputBase && candidateBase === inputBase) {
+    return 90;
+  }
+  if (inputStem && inputStem.length >= 3 && candidateStem === inputStem) {
+    return 86;
+  }
+  if (inputBase && inputBase.length >= 3 && candidateBase.endsWith(inputBase)) {
+    return 78;
+  }
+  if (inputStem && inputStem.length >= 3 && candidateStem.endsWith(inputStem)) {
+    return 74;
+  }
+  if (inputBase && inputBase.length >= 4 && candidateBase.includes(inputBase)) {
+    return 68;
+  }
+  if (inputStem && inputStem.length >= 4 && candidateStem.includes(inputStem)) {
+    return 64;
+  }
+  if (inputBase && inputBase.length >= 3 && isOrderedSubsequence(inputBase, candidateBase)) {
+    return 52;
+  }
+  if (inputStem && inputStem.length >= 3 && isOrderedSubsequence(inputStem, candidateStem)) {
+    return 48;
+  }
+  return 0;
 }

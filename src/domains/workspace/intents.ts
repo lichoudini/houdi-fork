@@ -66,6 +66,17 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
     original.match(/\b(?:llamado|llamada|de nombre|nombre|(?:se\s+)?llam(?:e|ado|ada)?)\s+([^\s"'`]+)\b/i)?.[1] ?? "",
   );
   const fileLikePath = deps.extractSimpleFilePathCandidate(original);
+  const inferredNamedPath = (() => {
+    const candidate = fromFilePhrase;
+    if (!candidate) {
+      return "";
+    }
+    const parts = candidate.split(/\s+/).filter(Boolean);
+    if (parts.length === 1 && !candidate.includes("@")) {
+      return candidate;
+    }
+    return deps.looksLikeWorkspacePathCandidate(candidate) ? candidate : "";
+  })();
   const hasCreateVerb =
     /\b(crea|crear|creame|creame|nuevo|nueva|nuevos|nuevas|genera|generar|generame|arma|armar|haz|hace|hacer)\b/.test(
       normalized,
@@ -120,7 +131,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
     }
     return "";
   };
-  const hasFileLikeToken = /\b[\w./\\-]+\.[a-z0-9]{2,8}\b/i.test(original);
+  const hasFileLikeToken = Boolean(fileLikePath);
   const defaultSelectorScope = deps.pickFirstNonEmpty(explicitWorkspacePath, fromFolderPhrase);
   const hasWorkspaceFileContext =
     hasWorkspaceWord || hasFileWord || hasFileLikeToken || quoted.length > 0 || Boolean(explicitWorkspacePath);
@@ -130,7 +141,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
     explicitWorkspacePath,
     explicitNamedPath,
     fileLikePath,
-    fromFilePhrase,
+    inferredNamedPath,
     deps.cleanWorkspacePathPhrase(readPhraseMatch?.[1] ?? ""),
   );
   const readPathHintNormalized = deps.normalizeIntentText(readPathHintRaw);
@@ -173,7 +184,7 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
     explicitWritePathHint,
     explicitNamedPath,
     fileLikePath,
-    fromFilePhrase,
+    inferredNamedPath,
   );
   const resolveWriteTargetPath = (rawTargetPath: string, extensionHint?: string): string => {
     const hinted = deps.resolveWorkspaceWritePathWithHint(rawTargetPath, extensionHint);
@@ -238,6 +249,16 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       };
     }
 
+    const strictDeleteCandidate = extractExplicitPathHint(deletePathCandidate);
+    const targetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, explicitDeletePathHint, strictDeleteCandidate);
+    if (targetPath) {
+      return {
+        shouldHandle: true,
+        action: "delete",
+        path: targetPath,
+      };
+    }
+
     if (deleteExtensions.length > 0) {
       return {
         shouldHandle: true,
@@ -252,12 +273,9 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
       defaultScopePath: defaultSelectorScope,
       rawQuotedSegments,
     });
-    const strictDeleteCandidate = extractExplicitPathHint(deletePathCandidate);
-    const targetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, explicitDeletePathHint, strictDeleteCandidate);
     return {
       shouldHandle: true,
       action: "delete",
-      ...(targetPath ? { path: targetPath } : {}),
       ...(selector ? { selector } : {}),
     };
   }
@@ -314,7 +332,13 @@ export function detectWorkspaceNaturalIntent(text: string, deps: WorkspaceIntent
     (hasCopyMessageToFileCue && Boolean(fileLikePath));
   if (writeIntent) {
     const formatHint = deps.detectSimpleTextExtensionHint(original);
-    const rawTargetPath = deps.pickFirstNonEmpty(quoted[0], explicitWorkspacePath, explicitNamedPath, fileLikePath, fromFilePhrase);
+    const rawTargetPath = deps.pickFirstNonEmpty(
+      quoted[0],
+      explicitWorkspacePath,
+      explicitNamedPath,
+      fileLikePath,
+      inferredNamedPath,
+    );
     const targetPath = resolveWriteTargetPath(rawTargetPath, formatHint);
     const content = deps.extractNaturalWorkspaceWriteContent({
       text: original,

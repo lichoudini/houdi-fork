@@ -1,8 +1,8 @@
 # Houdi Agent - Runbook Operativo
 
 ## 0. Perfiles de operación
-- `full-control` (host propio): mantener `DEFAULT_AGENT=operator` y usar `/agent set admin` solo para acciones puntuales de alto privilegio. Monitorear `journalctl`.
-- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false` salvo necesidad.
+- `full-control` (host propio): mantener `DEFAULT_AGENT=operator` y usar `/agent set admin` solo para acciones puntuales de alto privilegio. `operator` queda acotado al workspace; monitorear `journalctl`.
+- `moderated` (host compartido): `DEFAULT_AGENT=operator`, mantener `ENABLE_REBOOT_COMMAND=false` salvo necesidad y no desactivar `workspaceOnly` en `operator`.
 
 ## 1. Arranque normal
 ```bash

@@ -60,6 +60,7 @@ Buenas prácticas mínimas:
 - Evitar instalación en equipos con datos sensibles no relacionados.
 - Aplicar principio de mínimo privilegio en agentes y allowlists.
 - Mantener `DEFAULT_AGENT=operator` como valor por defecto y operar con mínimo privilegio.
+- `operator` arranca en modo `workspaceOnly` con allowlist explícita; reservar `admin` para sistema, rutas externas o tareas de alto privilegio.
 - Revisar logs/auditoría durante las primeras semanas de operación.
 
 ## Documentación
@@ -129,7 +130,7 @@ Perfil `moderated` (entorno compartido o más estricto):
 - Objetivo: minimizar riesgo de ejecución accidental.
 - Requerido: `DEFAULT_AGENT=operator` (default del proyecto).
 - Para tareas sensibles, cambiar agente temporalmente: `/agent set admin` y luego volver a `/agent set operator`.
-- Reducir allowlists en `agents/operator.json` y reservar `agents/admin.json` para casos puntuales.
+- Mantener `operator` como workspace-only y reservar `admin` para sistema, privilegios altos o rutas fuera del workspace.
 
 ## Requisitos
 
@@ -302,6 +303,7 @@ npm run start
 
 - validar `DEFAULT_AGENT=operator` en `.env`
 - revisar perfil de agente activo y allowlist
+- confirmar `PROXY_RESET_WORKSPACE_ON_START=false` para no vaciar el workspace en cada arranque
 - habilitar solo capacidades necesarias
 
 Configuración manual:
@@ -951,6 +953,7 @@ Comportamiento:
 ## Operación Segura por Agente
 
 1. Mantén `operator` como modo normal (default).
+   Es un perfil `workspaceOnly` con allowlist explícita para trabajo en archivos, web local y Gmail.
 
 2. Cuando necesites privilegios altos, cambia temporalmente a `admin`:
 

@@ -52,7 +52,7 @@ export function createGmailTextParsers(deps: GmailTextParsersDeps) {
   }
 
   function parseGmailLabeledFields(text: string): ParseGmailLabeledFieldsResult {
-    const pattern = /\b(asunto|subject|titulo|title|cuerpo|mensaje|texto|body|cc|bcc)\s*[:=-]\s*/gi;
+    const pattern = /\b(asunto|subject|titulo|title|cuerpo|mensaje|texto|contenido|body|cc|bcc)\s*[:=-]\s*/gi;
     const entries: Array<{ key: string; value: string }> = [];
     const matches: Array<{ key: string; labelIndex: number; valueStart: number }> = [];
     let match: RegExpExecArray | null;
@@ -78,7 +78,7 @@ export function createGmailTextParsers(deps: GmailTextParsersDeps) {
       .filter((entry) => ["asunto", "subject", "titulo", "title"].includes(entry.key))
       .map((entry) => entry.value);
     const bodyValues = entries
-      .filter((entry) => ["cuerpo", "mensaje", "texto", "body"].includes(entry.key))
+      .filter((entry) => ["cuerpo", "mensaje", "texto", "contenido", "body"].includes(entry.key))
       .map((entry) => entry.value);
     const ccValues = entries.filter((entry) => entry.key === "cc").map((entry) => entry.value);
     const bccValues = entries.filter((entry) => entry.key === "bcc").map((entry) => entry.value);

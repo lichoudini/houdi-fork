@@ -1,74 +1,26 @@
-import type { IntentRouteName, SemanticRouteDecision } from "../intent-semantic-router.js";
+import type { SemanticRouteDecision } from "../intent-semantic-router.js";
+import {
+  resolveBaseSemanticRouting,
+  type BaseSemanticRoutingResolution,
+  type ChatScopedRouterLike,
+  type HierarchicalIntentDecisionLike,
+  type IntentRouterFilterDecision,
+  type NaturalIntentRouteName,
+  type RouteLayerDecisionLike,
+  type RouterScoreBoosts,
+} from "../domains/router/natural-routing-core.js";
 
-export type NaturalIntentRouteName =
-  | "self-maintenance"
-  | "schedule"
-  | "memory"
-  | "gmail-recipients"
-  | "gmail"
-  | "workspace"
-  | "document"
-  | "web";
+export type {
+  ChatScopedRouterLike,
+  HierarchicalIntentDecisionLike,
+  IntentRouterFilterDecision,
+  NaturalIntentRouteName,
+  RouteLayerDecisionLike,
+  RouterScoreBoosts,
+} from "../domains/router/natural-routing-core.js";
 
 export type NaturalIntentHandlerName = NaturalIntentRouteName | "none";
-
-export type IntentRouterFilterDecision = {
-  allowed: string[];
-  reason: string;
-  strict: boolean;
-  exhausted: boolean;
-};
-
-export type RouteLayerDecisionLike = {
-  allowed: string[];
-  reason: string;
-  strict: boolean;
-  exhausted: boolean;
-  layers: string[];
-};
-
-export type HierarchicalIntentDecisionLike = {
-  allowed: string[];
-  reason: string;
-  strict: boolean;
-  exhausted: boolean;
-  domains: string[];
-};
-
-export type RouterScoreBoosts = Record<string, number>;
-
-export type ChatScopedRouterLike = {
-  router: {
-    route: (
-      text: string,
-      options?: {
-        allowed?: IntentRouteName[];
-        boosts?: RouterScoreBoosts;
-        alphaOverrides?: Record<string, number>;
-        topK?: number;
-      },
-    ) => SemanticRouteDecision | null;
-  };
-  abVariant: "A" | "B";
-  canaryVersionId: string | null;
-  effectiveAlpha: number;
-  effectiveMinGap: number;
-};
-
-export type RoutingResolution = {
-  hasMailContext: boolean;
-  hasMemoryRecallCue: boolean;
-  routeCandidates: NaturalIntentRouteName[];
-  routerLayerDecision: RouteLayerDecisionLike | null;
-  hierarchyDecision: HierarchicalIntentDecisionLike | null;
-  effectiveHierarchyDecision: HierarchicalIntentDecisionLike | null;
-  routeFilterDecision: IntentRouterFilterDecision | null;
-  semanticAllowedCandidates: NaturalIntentRouteName[];
-  strictNarrowingExhausted: boolean;
-  routeScoreBoosts: RouterScoreBoosts;
-  routerAbVariant: "A" | "B";
-  routerCanaryVersion: string | null;
-  semanticRouteDecision: SemanticRouteDecision | null;
+export type RoutingResolution = BaseSemanticRoutingResolution & {
   semanticCalibratedConfidence: number | null;
   semanticGap: number | null;
   shadowRouteDecision: SemanticRouteDecision | null;
@@ -156,140 +108,55 @@ export async function resolveNaturalIntentRouting(
   },
   deps: ResolveNaturalIntentRoutingDeps,
 ): Promise<RoutingResolution> {
-  const hasMailContext = /\b(correo|correos|mail|mails|email|emails|gmail|inbox|bandeja)\b/.test(params.normalizedText);
-  const hasMemoryRecallCue =
-    /\b(te\s+acordas|te\s+acuerdas|te\s+recordas|te\s+recuerdas|recordas|recuerdas|memoria|memory|habiamos\s+hablado|hablamos)\b/.test(
-      params.normalizedText,
-    );
-
-  const routeCandidates = [...params.handlerNames];
-  const isNaturalRouteName = (value: string): value is NaturalIntentRouteName => {
-    return routeCandidates.includes(value as NaturalIntentRouteName);
-  };
-  const toNaturalCandidates = (values: string[]): NaturalIntentRouteName[] => {
-    return values.filter((value): value is NaturalIntentRouteName => isNaturalRouteName(value));
-  };
-  const indexedListKind = deps.getIndexedListKind(params.chatId);
-  const hasPendingWorkspaceDelete = deps.hasPendingWorkspaceDeleteConfirmation(params.chatId);
-
-  const routerLayerDecision = deps.applyIntentRouteLayers(routeCandidates, {
-    normalizedText: params.normalizedText,
-    hasMailContext,
-    hasMemoryRecallCue,
-    indexedListKind,
-    hasPendingWorkspaceDelete,
+  const baseResolution = resolveBaseSemanticRouting(params, {
+    getIndexedListKind: deps.getIndexedListKind,
+    hasPendingWorkspaceDeleteConfirmation: deps.hasPendingWorkspaceDeleteConfirmation,
+    applyIntentRouteLayers: deps.applyIntentRouteLayers,
+    narrowRouteCandidates: deps.narrowRouteCandidates,
+    buildHierarchicalIntentDecision: deps.buildHierarchicalIntentDecision,
+    buildIntentRouterContextFilter: deps.buildIntentRouterContextFilter,
+    buildIntentRouterScoreBoosts: deps.buildIntentRouterScoreBoosts,
+    buildIntentRouterForChat: deps.buildIntentRouterForChat,
+    alphaOverrides: deps.alphaOverrides,
   });
-
-  const layerAllowedCandidatesRaw = routerLayerDecision ? toNaturalCandidates(routerLayerDecision.allowed) : routeCandidates;
-  const layerNarrowed = routerLayerDecision
-    ? deps.narrowRouteCandidates(routeCandidates, layerAllowedCandidatesRaw, { strict: routerLayerDecision.strict })
-    : { allowed: routeCandidates, exhausted: false };
-
-  const layerAllowedCandidates = layerNarrowed.allowed;
-  const hierarchyDecision = deps.buildHierarchicalIntentDecision({
-    normalizedText: params.normalizedText,
-    candidates: layerAllowedCandidates,
-    hasMailContext,
-    hasMemoryRecallCue,
-    indexedListKind,
-    hasPendingWorkspaceDelete,
-  });
-
-  const hierarchyAllowedCandidatesRaw = hierarchyDecision
-    ? toNaturalCandidates(hierarchyDecision.allowed)
-    : layerAllowedCandidates;
-  const hierarchyNarrowed = hierarchyDecision
-    ? deps.narrowRouteCandidates(layerAllowedCandidates, hierarchyAllowedCandidatesRaw, { strict: hierarchyDecision.strict })
-    : { allowed: layerAllowedCandidates, exhausted: false };
-
-  let effectiveHierarchyDecision = hierarchyDecision;
-  let hierarchyAllowedCandidates = hierarchyNarrowed.allowed;
-
-  if (
-    hierarchyAllowedCandidates.length === 0 &&
-    layerAllowedCandidates.length > 0 &&
-    routerLayerDecision &&
-    routerLayerDecision.strict
-  ) {
-    hierarchyAllowedCandidates = layerAllowedCandidates;
-    effectiveHierarchyDecision = null;
-  }
-
-  const routeFilterDecision = deps.buildIntentRouterContextFilter({
-    chatId: params.chatId,
-    text: params.text,
-    candidates: hierarchyAllowedCandidates,
-    hasMailContext,
-    hasMemoryRecallCue,
-  });
-
-  const semanticAllowedCandidates = routeFilterDecision
-    ? toNaturalCandidates(routeFilterDecision.allowed)
-    : hierarchyAllowedCandidates;
-
-  const strictNarrowingExhausted = Boolean(
-    (routerLayerDecision?.strict &&
-      (routerLayerDecision.exhausted || layerNarrowed.exhausted || layerAllowedCandidates.length === 0)) ||
-    (effectiveHierarchyDecision?.strict &&
-      (effectiveHierarchyDecision.exhausted || hierarchyNarrowed.exhausted || hierarchyAllowedCandidates.length === 0)) ||
-    (routeFilterDecision?.strict && (routeFilterDecision.exhausted || semanticAllowedCandidates.length === 0)),
-  );
-
-  const routeScoreBoosts = deps.buildIntentRouterScoreBoosts({
-    chatId: params.chatId,
-    text: params.text,
-    hasMailContext,
-    hasMemoryRecallCue,
-  });
-
-  const chatScopedRouter = deps.buildIntentRouterForChat(params.chatId);
-  const routerAbVariant = chatScopedRouter.abVariant;
-  const routerCanaryVersion = chatScopedRouter.canaryVersionId;
-
-  const semanticRouteDecision =
-    semanticAllowedCandidates.length > 0
-      ? chatScopedRouter.router.route(params.text, {
-          allowed: semanticAllowedCandidates,
-          boosts: routeScoreBoosts,
-          alphaOverrides: deps.alphaOverrides,
-          topK: 5,
-        })
-      : null;
 
   let semanticGap: number | null = null;
   let semanticCalibratedConfidence: number | null = null;
-  if (semanticRouteDecision) {
-    const second = semanticRouteDecision.alternatives[1];
-    semanticGap = second ? semanticRouteDecision.score - second.score : null;
-    semanticCalibratedConfidence = deps.calibrateConfidence(semanticRouteDecision.handler, semanticRouteDecision.score);
+  if (baseResolution.semanticRouteDecision) {
+    const second = baseResolution.semanticRouteDecision.alternatives[1];
+    semanticGap = second ? baseResolution.semanticRouteDecision.score - second.score : null;
+    semanticCalibratedConfidence = deps.calibrateConfidence(
+      baseResolution.semanticRouteDecision.handler,
+      baseResolution.semanticRouteDecision.score,
+    );
   }
 
   const shadowRouteDecision =
-    semanticAllowedCandidates.length > 0 && deps.shouldRunIntentShadowMode(params.chatId, params.text)
+    baseResolution.semanticAllowedCandidates.length > 0 && deps.shouldRunIntentShadowMode(params.chatId, params.text)
       ? deps.runShadowRoute({
           text: params.text,
-          allowed: semanticAllowedCandidates,
-          boosts: routeScoreBoosts,
+          allowed: baseResolution.semanticAllowedCandidates,
+          boosts: baseResolution.routeScoreBoosts,
           alphaOverrides: deps.alphaOverrides,
           topK: 5,
         })
       : null;
 
-  const aiRouteDecision = deps.shouldRunAiJudgeForEnsemble(semanticRouteDecision)
+  const aiRouteDecision = deps.shouldRunAiJudgeForEnsemble(baseResolution.semanticRouteDecision)
     ? await deps.classifyNaturalIntentRouteWithAi({
         chatId: params.chatId,
         text: params.text,
-        candidates: semanticAllowedCandidates,
+        candidates: baseResolution.semanticAllowedCandidates,
       })
     : null;
 
   const ranked = deps.rankIntentCandidatesWithEnsemble({
-    candidates: semanticAllowedCandidates,
-    semanticAlternatives: semanticRouteDecision?.alternatives,
+    candidates: baseResolution.semanticAllowedCandidates,
+    semanticAlternatives: baseResolution.semanticRouteDecision?.alternatives,
     aiSelected:
       aiRouteDecision?.handler && aiRouteDecision.handler !== "none" ? (aiRouteDecision.handler as NaturalIntentRouteName) : null,
-    layerAllowed: routerLayerDecision ? toNaturalCandidates(routerLayerDecision.allowed) : routeCandidates,
-    contextualBoosts: routeScoreBoosts,
+    layerAllowed: baseResolution.layerAllowedCandidates,
+    contextualBoosts: baseResolution.routeScoreBoosts,
     calibratedConfidence: semanticCalibratedConfidence,
   });
 
@@ -302,36 +169,20 @@ export async function resolveNaturalIntentRouting(
 
   const routedHandlerNames = (() => {
     if (ensembleTop.length === 0) {
-      return routeCandidates;
+      return baseResolution.routeCandidates;
     }
     const ordered = ensembleTop.map((item) => item.name);
     const used = new Set(ordered);
-    return [...ordered, ...routeCandidates.filter((name) => !used.has(name))];
+    return [...ordered, ...baseResolution.routeCandidates.filter((name) => !used.has(name))];
   })();
 
   return {
-    hasMailContext,
-    hasMemoryRecallCue,
-    routeCandidates,
-    routerLayerDecision,
-    hierarchyDecision,
-    effectiveHierarchyDecision,
-    routeFilterDecision,
-    semanticAllowedCandidates,
-    strictNarrowingExhausted,
-    routeScoreBoosts,
-    routerAbVariant,
-    routerCanaryVersion,
-    semanticRouteDecision,
+    ...baseResolution,
     semanticCalibratedConfidence,
     semanticGap,
     shadowRouteDecision,
     aiRouteDecision,
     ensembleTop,
     routedHandlerNames,
-    chatScopedRouterMeta: {
-      effectiveAlpha: chatScopedRouter.effectiveAlpha,
-      effectiveMinGap: chatScopedRouter.effectiveMinGap,
-    },
   };
 }

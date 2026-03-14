@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import type { AgentProfile } from "../agents.js";
+import { composeAbortSignal } from "./abort-utils.js";
 import { proxyConfig } from "./config.js";
 import type { ExecutedCommand, ObjectiveVerification } from "./types.js";
 import { parseObjectiveVerification } from "./types.js";
@@ -50,8 +51,9 @@ function buildVerifierSystemPrompt(): string {
     "2) Si el objetivo ya fue satisfecho, status=success.",
     "3) Si no está satisfecho pero se puede seguir, status=continue.",
     "4) Si hay bloqueo real (errores persistentes/permisos/imposible), status=blocked.",
-    "5) summary debe ser corto y accionable.",
-    "6) Si el objetivo era listar/ver directorio y hubo comando de listado con exitCode=0, es success aunque el directorio esté vacío.",
+    "5) summary debe ser corto, accionable y escrito para un humano final.",
+    "6) No expongas comandos, ids, flags, exit codes ni nombres internos salvo que el usuario los haya pedido.",
+    "7) Si el objetivo era listar/ver directorio y hubo comando de listado con exitCode=0, es success aunque el directorio esté vacío.",
   ].join("\n");
 }
 
@@ -315,6 +317,8 @@ export class ObjectiveVerifier {
     latestCommands: string[];
     latestResults: ExecutedCommand[];
     history: ExecutedCommand[];
+    signal?: AbortSignal;
+    timeoutMs?: number;
   }): Promise<ObjectiveVerification> {
     const userPrompt = [
       `Objetivo del usuario: ${params.objective}`,
@@ -340,20 +344,27 @@ export class ObjectiveVerifier {
       "Devuelve el veredicto con el schema.",
     ].join("\n\n");
 
-    const response = await this.client.responses.create({
-      model: proxyConfig.openAiModel,
-      max_output_tokens: 260,
-      input: [
-        {
-          role: "system",
-          content: buildVerifierSystemPrompt(),
-        },
-        {
-          role: "user",
-          content: userPrompt,
-        },
-      ],
+    const signal = composeAbortSignal({
+      signal: params.signal,
+      timeoutMs: params.timeoutMs,
     });
+    const response = await this.client.responses.create(
+      {
+        model: proxyConfig.openAiModel,
+        max_output_tokens: 260,
+        input: [
+          {
+            role: "system",
+            content: buildVerifierSystemPrompt(),
+          },
+          {
+            role: "user",
+            content: userPrompt,
+          },
+        ],
+      },
+      signal ? { signal } : undefined,
+    );
 
     const raw = extractTextOutput(response).trim();
     if (!raw) {

@@ -105,6 +105,18 @@ test("gmail send with explicit subject/body keeps explicit values", () => {
   assert.equal(intent.body, "Te escribo para confirmar.");
 });
 
+test("gmail send accepts structured fields without explicit send verb", () => {
+  const intent = detectGmailNaturalIntent(
+    "usuario@example.com asunto: Hola contenido: Te escribo para confirmar.",
+    deps,
+  );
+  assert.equal(intent.shouldHandle, true);
+  assert.equal(intent.action, "send");
+  assert.equal(intent.to, "usuario@example.com");
+  assert.equal(intent.subject, "Hola");
+  assert.equal(intent.body, "Te escribo para confirmar.");
+});
+
 test("gmail send parses natural cc syntax without labels", () => {
   const intent = detectGmailNaturalIntent(
     "Enviar un correo a usuario@example.com cc a copia@example.com",
